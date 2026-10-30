@@ -34,6 +34,20 @@ int main() {
     }
     std::istringstream normal("MemTotal: 999999 kB\nMemAvailable:    12345 kB\nSwapFree: 777 kB\n");
     check(conversation_mem_available(normal) == 12345ULL * 1024, "only MemAvailable is counted");
+    // SwapFree: the opt-in parking allowance (STRATA_PARK_SWAP_GIB) reads only this key, and it must not be
+    // confused with MemAvailable - counting swap as RAM is exactly the bug the allowance exists to bound.
+    {
+        std::istringstream swap_ok("MemAvailable:    12345 kB\nSwapFree:    777 kB\nSwapTotal: 999 kB\n");
+        check(conversation_swap_free(swap_ok) == 777ULL * 1024, "SwapFree is read on its own");
+    }
+    for (const char* text : {"", "SwapFree: 1 MB\n", "SwapFree: -1 kB\n", "SwapFree: 1 kB\nSwapFree: 2 kB\n"}) {
+        std::istringstream input(text);
+        check(!conversation_swap_free(input), "missing/malformed swap telemetry is unknown, not zero-filled");
+    }
+    {
+        std::istringstream no_swap("SwapTotal: 0 kB\nSwapFree: 0 kB\n");
+        check(conversation_swap_free(no_swap) == 0, "a host without swap reads as zero, not unknown");
+    }
     std::istringstream zero("MemAvailable: 0 kB");
     check(conversation_mem_available(zero) == 0, "zero available memory is known");
     std::istringstream broken("MemAvailable: 123 kB\n");

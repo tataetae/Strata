@@ -252,6 +252,10 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     return meminfo_kb_bytes(meminfo, "MemAvailable:");
 }
 
+std::optional<uint64_t> conversation_swap_free(std::istream& meminfo) {
+    return meminfo_kb_bytes(meminfo, "SwapFree:");
+}
+
 void set_memory_limit_bytes(uint64_t bytes) { g_memory_limit_bytes.store(bytes, std::memory_order_relaxed); }
 uint64_t memory_limit_bytes() { return g_memory_limit_bytes.load(std::memory_order_relaxed); }
 

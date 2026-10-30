@@ -79,6 +79,12 @@ inline int64_t auto_conversation_cache_mib(std::optional<uint64_t> available, in
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
+/// Free swap in bytes from the same meminfo stream (nullopt when unknown).  Used only by the opt-in
+/// swap-backed parking admission (STRATA_PARK_SWAP_GIB): MemAvailable is defined as memory obtainable
+/// *without* swapping, so a snapshot larger than the free RAM is refused even when the swap file could
+/// hold it and the kernel would page it out straight afterwards.
+std::optional<uint64_t> conversation_swap_free(std::istream& meminfo);
+
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
     return available && *available >= floor && allocation <= *available - floor;

@@ -10584,10 +10584,36 @@ int main(int argc, char** argv) {
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
                 size_t evicted = 0;
                 std::optional<strata::core::HostMemoryReading> mem;
+                // Opt-in swap-backed parking: STRATA_PARK_SWAP_GIB=N counts up to N GiB of FREE SWAP as
+                // headroom for a parked conversation.  The gate samples MemAvailable, which by definition
+                // excludes swap, so a snapshot bigger than the free RAM is refused and the oldest parked
+                // conversation is evicted instead - a finished prompt read thrown away for a snapshot the
+                // swap file could have held.  With an allowance the decision becomes "park, and let the
+                // kernel page the cold snapshot out" (vm.swappiness); the restore pays the page-in instead of
+                // re-reading the prompt.  0 (default): physical RAM only, exactly as before.
+                const int64_t park_swap_gib = [] {
+                    const char* env = std::getenv("STRATA_PARK_SWAP_GIB");
+                    if (!env || !*env) return int64_t{0};
+                    const long long v = std::strtoll(env, nullptr, 10);
+                    return v > 0 ? (int64_t) v : int64_t{0};
+                }();
+                uint64_t swap_allowance = 0;
                 auto admit = [&] {
                     mem = strata::core::sample_host_memory();
-                    return strata::core::conversation_memory_admit(
-                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                    std::optional<uint64_t> available =
+                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                    swap_allowance = 0;
+                    if (available && park_swap_gib > 0) {
+                        std::ifstream swap_file(strata::core::MemoryProbePaths{}.meminfo);
+                        const auto free_swap =
+                            swap_file ? strata::core::conversation_swap_free(swap_file) : std::nullopt;
+                        if (free_swap && *free_swap) {
+                            const uint64_t cap = (uint64_t) park_swap_gib << 30;
+                            swap_allowance = *free_swap < cap ? *free_swap : cap;
+                            *available += swap_allowance;
+                        }
+                    }
+                    return strata::core::conversation_memory_admit(available, additional, floor);
                 };
                 while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
@@ -10598,6 +10624,9 @@ int main(int argc, char** argv) {
                                  evicted, conversations.size());
                     return true;
                 }
+                if (swap_allowance > 0 && mem && additional > mem->available)
+                    std::fprintf(stderr, "strata serve: conversation cache: swap-backed parking: %zu MiB snapshot on %zu MiB free RAM, %zu MiB of the allowance used\n",
+                                 additional >> 20, (size_t) (mem->available >> 20), (size_t) (swap_allowance >> 20));
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
