@@ -762,6 +762,33 @@ evictions mattered. End-to-end wall time for a warm continuation through Hermes:
 **The GPU3 card at PCI 0000:08:00.0 is still dead** (Xid 79, fallen off the bus) and needs the physical
 riser reseat; until then the engine runs on 3 cards at roughly half the decode throughput.
 
+## 2026-11-21 05:20 — everything pushed; the owner is resetting the box
+
+**The owner decided to stop using local inference** and to reset the machine, so everything was pushed
+before the reset:
+
+| what | where |
+|---|---|
+| the whole Hermes tree (v0.23.3 merge + the Clara customizations) | `github.com/tataetae/hermes-agent` branch **`clara/v0.23.3-merge`** (HEAD `33cbdad2ef`); a fork of NousResearch/hermes-agent was created because the upstream denies write access to this account |
+| the session record, the tooling, the engine profiles, the systemd drop-ins, the Hindsight env | `github.com/tataetae/Strata` branch **`clara/hermes-state`** (HEAD `6cdbfec92`), under `docs/hermes/` — `README.md` has the rebuild order, `AGENTS.md` the full record, `tools/` the scripts (they lived in `/tmp/opencode` and would have been wiped) |
+| the pre-update backup (2.0 GB of `state.db` + configs) | `/home/clara/backup/hermes-pre-update-20261121T0417` — **local only, it did not survive the push** (too big for git) |
+
+No secrets were committed: the engine key is read from the Hermes config at run time and the Hindsight
+env's key is a placeholder.
+
+**What the reset will undo (the README's rebuild order):** the tree's own git remote is the read-only
+upstream, so `git pull` alone does NOT bring the merge back — the branch must be fetched from the fork;
+the engine profile (`docs/hermes/strata-iq4xs-3gpu-live.json`), the systemd drop-ins (without them the
+gateway crash-loops on `ArgsKwargs`), the Hindsight env, and every profile's model route all need
+restoring.
+
+**On the surprise that 4 GPUs ran and 3 GPUs also ran:** the split was never the limit — the *card count*
+is only what `layer_split` has to match. 4 GPUs gave 12,920 expert slots / chunk 8,192 / 2.5 ms CPU-expert
+per window; 3 GPUs give 7,244 slots / chunk 6,400 / 17–27 ms. The engine's own `auto` search places the
+stages by free VRAM, so it re-cut itself (K=13,32) and ran correctly on 3 cards. The missing card costs
+roughly **half the decode throughput** (7.6–13.7 tok/s vs 20–40) — that is the one real price of the dead
+GPU, and the reason the owner stopped using local inference.
+
 ## OPEN: Thai text generation leaks wrong tokens (owner-reported 2026-11-20)
 
 **Symptom** (reported by the Boxcat/system-maintainer agent's own Thai test, 609 chars):
