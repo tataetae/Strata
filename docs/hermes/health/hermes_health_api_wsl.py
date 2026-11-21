@@ -628,8 +628,8 @@ ENGINE_BOOL_FLAGS = {"--batch-mtp", "--prompt-cache-spread", "--trim-stage-weigh
 def _engine_pack() -> dict[str, Any]:
     """The pack the running engine actually loaded, its quant, and its fixed launch flags.
 
-    The profile still carries `model: qwen3.8-flash-next-iq3_s` while the box serves the IQ3_XXS pack, so
-    anything that reads the config string names the wrong weights. This reads the engine's own command
+    The profile's `model:`/`pack:` strings are not the truth (the profile still carried the deleted
+    IQ3_S build and the Q4_K_XL pack while the box serves UD-IQ4_XS), so This reads the engine's own command
     line instead — the same source the rest of the stack trusts — and reports the launch flags verbatim
     rather than re-deriving them from a config file.
     """
@@ -649,7 +649,10 @@ def _engine_pack() -> dict[str, Any]:
                 continue
             pack = argv[argv.index("--pack") + 1]
             name = pack.rstrip("/").rsplit("/", 1)[-1]
-            quant = {"iq3_xxs": "IQ3_XXS", "iq3_s": "IQ3_S", "iq2_xs": "IQ2_XS"}.get(name, name.upper())
+            quant = {
+                "iq4_xs": "IQ4_XS", "iq4_nl": "IQ4_NL", "q4_k_xl": "Q4_K_XL", "q3_k_xl": "Q3_K_XL",
+                "iq3_xxs": "IQ3_XXS", "iq3_s": "IQ3_S", "iq2_xs": "IQ2_XS",
+            }.get(name, name.upper())
             flags: dict[str, Any] = {}
             for index, token in enumerate(argv):
                 key = ENGINE_VALUE_FLAGS.get(token)
@@ -755,7 +758,7 @@ PROMPT_CACHE_RE = re.compile(
     r"(?:\s*\(limits:\s*([0-9.]+)\s*MiB,\s*(\d+)\s*tokens,\s*(\d+)\s*est\))?")
 
 
-STRATA_ENGINE_LOG = "/home/clara/local-inference/strata-src/strata-iq3_xxs.log"
+STRATA_ENGINE_LOG = "/home/clara/local-inference/strata-src/strata-iq4xs.log"
 PARKED_BYTES_RE = re.compile(r"bytes=(\d+) evictions=")   # the parked set, not snapshot_bytes/reused_kv_bytes
 
 

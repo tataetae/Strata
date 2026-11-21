@@ -84,7 +84,7 @@
     "0": "main"
   },
   "mtp": true,
-  "parallel": 1,
+  "parallel": 3,
   "vision": {
     "exe": "/home/clara/local-inference/strata-src/engine/strata-vision",
     "mmproj": "/srv/inference/models/qwen3.8-flash-next/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
@@ -163,5 +163,5 @@
     "repetition_penalty": 1.0
   },
   "slot_save_path": "/srv/inference/sessions",
-  "pack": "/srv/inference/models/qwen3.8-flash-next/packs/q4_k_xl"
+  "pack": "/srv/inference/models/qwen3.8-flash-next/packs/iq4_xs"
 }

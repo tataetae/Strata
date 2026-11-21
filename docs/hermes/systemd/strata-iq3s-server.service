@@ -1,0 +1,25 @@
+[Unit]
+Description=Strata UD-IQ4_XS inference server (4 GPUs, 3 slots, K/V in RAM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/home/clara/.config/opencode/strata.env
+Type=simple
+User=clara
+Group=clara
+WorkingDirectory=/home/clara/local-inference/strata-src
+Environment=HOME=/home/clara
+Environment=HERMES_HOME=/home/clara/.hermes
+Environment=PATH=/home/clara/.hermes/bin:/home/clara/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin
+LimitMEMLOCK=infinity
+LimitNOFILE=524288
+ExecStart=/home/clara/local-inference/strata-src/.venv/bin/python strata.py serve --profile strata-iq4xs.json --parallel 3 --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=10
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
