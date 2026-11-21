@@ -1063,6 +1063,48 @@ dependency re-opening) would spawn a worker again — that is the one thing to w
 **Final state:** engine `queued=0`, **0 requests in 180 s**, 3 slots free for the owner's chat,
 conversation cache parked 23 / **evictions 0** / 3.99 M tokens reused.
 
+## 2026-11-21 11:10 → 11:30 — "have we updated the engine service itself?" → four stale references, and the auto-decomposer
+
+**The engine service WAS updated** (the live `ExecStart` is `--profile strata-iq4xs.json --parallel 3`,
+the cgroup carries MemoryHigh 80 GiB / MemoryLow 72 GiB / MemoryMax 136 GiB, the `STRATA_*` env has
+every tuning knob, and the profile itself has the staged flags: `--kv int8`,
+`--mtp-draft-vocab .../draft_vocab_thai.bin`, `--kv-resident 32768`, `--conversation-cache-slots 128`,
+`--adapt-min-gain 6`). **But four references inside the service's own plumbing were stale:**
+
+1. **The base unit's `ExecStart` still named the DELETED profile** `strata-iq3_xxs.json` with
+   `--parallel 1` (the drop-ins masked it — lose the drop-in and the engine crash-loops on a missing
+   file). The base unit now carries the live shape, and the Description reads
+   "Strata UD-IQ4_XS inference server (4 GPUs, 3 slots, K/V in RAM)" instead of "IQ3_S".
+   (backup `strata-iq3s-server.service.bak-20261121T1115`)
+2. **The profile's `parallel` said 1** while the service runs 3, and **`pack` still pointed at
+   `packs/q4_k_xl`** while the engine serves `packs/iq4_xs`. Both are metadata (the CLI args win at
+   runtime) but the **pushed copy carried them** — a rebuild from git would have produced **one slot
+   instead of three**. Both are now correct in `strata-iq4xs.json` and in
+   `docs/hermes/strata-iq4xs-live.json`.
+3. **Three scripts read a dead engine log.** `hermes_health_api_wsl.py` pointed at the **deleted**
+   `strata-iq3_xxs.log`; `strata_task_logger.py` and `stall-watch.py` pointed at the **frozen**
+   `strata-iq3_s.log`. So the dashboard's engine block and the logger's counters were reading a file
+   the engine stopped writing 3 days ago. All three now follow `strata-iq4xs.log` — the health API's
+   engine block now reports the live `model qwen3.8-flash-next-iq4_xs / kv int8 / expert_cache 25,842
+   MiB / batch 3+3`, and the task logger follows the live log again.
+4. The health API's **quant map did not know `iq4_xs`** (it was right only by the upper-case
+   fallback). It is explicit now, with `iq4_nl / q4_k_xl / q3_k_xl` alongside the IQ ones.
+
+**The auto-decomposer was the last background writer.** Unblocking the ledger **F8** card made the
+dispatcher **split it into three children** (`t_9eefb4f6` reproduce+triage, `t_3accdc53` fix to zero
+errors, `t_7fdb7777` qc verify) — so parking the parent was not enough: the children had to be parked
+too, and the parent was then **promoted back to `todo`** by `recompute_ready` and spawned again.
+**`kanban.auto_decompose: false` is now in `/home/clara/.hermes/config.yaml`** (the toggle is re-read
+every dispatch tick, so it needs no restart). Set it back to `true` when the p14 lane resumes — but
+expect F8 to fan out again.
+
+**The trap to remember: a `todo` card cannot be `blocked`** — `block_task` only transitions
+`running`/`ready`. A `todo` card must be **`schedule`d** (Scheduled cards are not dispatched) or given
+`--kind needs_input` on a `blocked` card. Every card I parked this way is Scheduled or in triage.
+
+**Final state:** 0 dispatchable cards on every board, 0 kanban workers, 0 cron jobs enabled (39/39
+paused), the summariser batch and the watchdog stopped, engine **queued=0, 0 requests in 60 s**.
+
 ## Rules
 - Old disks stay read-only. Never expose 8647/9119 beyond the LAN without auth.
 - Don't send external messages on the owner's behalf. Don't delete the only copy of anything.
