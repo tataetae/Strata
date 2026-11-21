@@ -633,10 +633,14 @@ gateway holds open; the rest are ROOT webui sessions (old, 1.2k–2.5k h) plus a
 ## 2026-11-20 18:28 → 19:00 — GPU3 FELL OFF THE BUS (Xid 79) and the engine crash-looped
 
 **What happened.** At 18:28:19 the kernel logged `NVRM: Xid (PCI:0000:08:00): 79, GPU has fallen off the
-bus` for the card at PCI **0000:08:00.0** (the engine's **CUDA3**, profile `gpu [1,3,2,0]`). That is the
-card behind the **M.2_2 riser / root port `00:1a.0`** — the exact hardware the owner was going to
-reseat tonight. The AER errors on `00:1a.0` had been escalating all evening (18:04:56, 18:15:49,
-18:22:05 → the fatal at 18:28:19) and `00:1d.7` (GPU1's port) threw a Physical-Layer AER at 18:28:19.
+bus` for the card at PCI **0000:08:00.0** (the engine's **CUDA3**, profile `gpu [1,3,2,0]`).
+**Topology correction (verified 2026-11-21 from `lspci -D -t` + `nvidia-smi`):** `08:00.0` is the **x1**
+card on root port **`00:1d.7`** (the M.2_2 riser); `00:1a.0` carries **`03:00.0` = GPU1**, the *Lite Hash
+Rate* SKU (`10de:2504`, x4). The AER errors on `00:1a.0` had been escalating all evening (18:04:56,
+18:15:49, 18:22:05) and `00:1d.7` threw a Physical-Layer AER at 18:28:19 — the escalation belonged to
+**GPU1's** port, but the card that actually **died** was GPU3's on `00:1d.7`. After the reseat the
+`00:1d.7` counters read **0** and the `00:1a.0` ones read 1 (RxErr) — so the reseat fixed the right
+card and GPU1's link is still the marginal one.
 
 **The engine crash-looped from 18:30 to 18:52 (exit code 2).** The cause was NOT a config bug:
 `src/program/generate.cpp:3539-3560` derives `--split-device` from the **visible** card count
@@ -665,7 +669,7 @@ profile must be re-cut for the surviving cards (or `layer_split` set to `auto`) 
 
 **Also:** `nvidia-smi -r -i 3` cannot reset a card that has fallen off the bus ("Unable to determine
 the device handle"), and `rmmod nvidia_modeset` needs `-f` while `nvidia_drm` holds it. The remaining
-fix is physical: reseat the M.2_2 riser / the `00:1a.0` cable, then restore `strata-iq4xs-4gpu.json`
+fix is physical: reseat the M.2_2 riser / the **`00:1d.7`** cable, then restore `strata-iq4xs-4gpu.json`
 and restart — a reboot is also acceptable (the modules are reloaded at boot).
 
 **The overnight watchdog, v2.** The v1 watchdog exited early ("batch finished on its own") during the
@@ -911,6 +915,78 @@ hundreds of lines) on 2026-11-19 evening.
 - OpenCode provider `strata/qwen3.8-flash-next-iq4_xs`. FreeCAD 1.1.4 streamed at `http://192.168.1.36:6080/vnc.html` (pw `clara-freecad-2026`).
 - UFW allows 22, 6080, 8080, 8647, 8787, 9119, 9120. `8788` is loopback-only by design — reach the WebUI on
   `8787` (nginx) or through the `.80` relay, never by opening 8788.
+
+## 2026-11-21 08:00 → 09:20 — the sweep winner, the false-success fix, and the p14 lane wakes up
+
+**The engine shape sweep (6 arms, 4 GPUs back).** Each arm was a full engine restart plus a 3–4 client
+cold-prefill + decode run (`/tmp/opencode/arms.py`, results in `/tmp/opencode/sweep_results.jsonl`).
+Absolute rates are depressed by the Boxcat bot's own traffic, but the arms are like-for-like.
+
+| arm | wall s | prefill tok/s | decode tok/s | evictions | reused tok |
+|---|---|---|---|---|---|
+| A0 baseline (kv 20480, 3 slots) | 634.6 | 455.5 / 423.0 / 414.3 | — | 0 | 731 k |
+| A1 2 slots | 696.2 | 408.0 / 405.4 / 383.3 | — | 0 | 937 k |
+| A2 4 slots, kv 20480 | 708.0 | 539.6 / 484.9 / 450.8 | 15.2 / 10.8 / 8.6 / 8.2 | 0 | 1.28 M |
+| A3 3 slots, kv 32768 | 686.1 | 503.4 / 476.3 / 466.7 | 15.1 / 12.9 / 11.1 / 10.8 | 0 | 1.74 M |
+| **B0 3 slots, kv 32768** | **555.8** | **503.5 / 500.2 / 487.8** | **46.3 / 35.2 / 24.1 / 18.7** | **0** | **2.20 M** |
+| B1 4 slots, kv 32768 | 598.8 | 546.6 / 540.1 / 489.8 | 47.5 / 38.1 / 15.3 / 14.1 | 0 | 2.24 M |
+
+**Winner = B0: `--parallel 3 --batch-groups 3 --kv-resident 32768`** (applied 08:36, live: 11,096 expert
+slots, chunk 6,912, split `0-8/9-21/22-35/36-47`, `layer_split: auto`). Four slots buy a 4th resident
+session but cost the per-stream rate (the 4th stream runs at half speed). `--kv-resident 32768` is the
+single biggest lever: it moves the K/V to pinned RAM and gives the freed VRAM to the expert cache.
+
+**The summariser's FALSE SUCCESSES — Boxcat caught it, and it was right.** The batch had reported
+"compressed in 523s" for **13 sessions that had `compacted=0` rows**. `result.status` only says the
+summariser RAN; only the DB says the archive LANDED. `fire_compress.py` now does a **COMMIT CHECK**
+(`compacted_rows` + rotated children) and returns `false_success` when nothing was archived; the batch
+runner counts that as a failure. Verified on the session Boxcat named: `a23fd9b5de72` 507,756 → 125,017
+tok, 833 → 299 messages, 542 rows archived (DB now reads active=299 / compacted=542). Rebuilt the batch
+list from the DBs: **24 live chats over 150k tokens, 11 genuinely compacted, 13 false**.
+
+**The watchdog is now v3 (Boxcat's stricter rule).** `/tmp/opencode/watchdog.sh` stops the batch only when
+`/health` fails **3 consecutive times AND the engine's systemd unit is inactive** (the engine really died),
+or when PSI memory avg10 > 40, or MemAvailable < 2 GiB. v1 stopped the batch on a SINGLE timeout while
+the engine was healthy; `/health` answers in 0.00–0.02 s here even mid-prefill (measured, 8 probes).
+
+**The p14 software lane woke up.** It was not the dispatcher: the dispatcher runs in the **gateway**
+(`kanban.dispatch_in_gateway: true`), holds the singleton lock (`~/.hermes/kanban/.dispatcher.lock`, PID
+1685), ticks every 60 s, and `dispatch_profiles` is **absent from the config → "any"** (`hermes kanban
+diagnostics` says so). The lane was idle because the board held **41 blocked / 2 done and ZERO ready**
+cards. The only card whose documented gate was a *resolved* condition was **`t_7cdf55f7` (ledger B8)**,
+blocked by "the Strata engine is saturated" — unblocked it (the owner's authorisation to restart the
+engine and continue the p14 work), and the dispatcher claimed → spawned (`pid 113745`) → the **software
+profile's owner admitted the claim** (`owner_admitted`, session `local-f1cc32cb…`) → the agent is running
+the card. The card's workspace is a **scratch dir** (`…/boards/p14/workspaces/t_7cdf55f7`), `project_id`
+and `branch_name` are NULL, so the agent must find the code itself — the p14 clones live in
+`~/workspace/p14-handoff-20261101/{p14-backend,p14-frontend,p14-plc}` (the software profile's MEMORY.md
+says so). **`/home/p14/repo` does NOT exist on this box** — the card bodies still point at it.
+**Still blocked for the owner, not for me:** 5 HUMAN cards (A1–A4, E1, E2, C1–C5, F3, D1, D3, E6 — the
+site/physical ones), plus the PLC cards (a real-PLC download needs authority that
+`SITE-DEPLOYMENT-AUTHORIZATION-20261112.md` withholds).
+
+**Do NOT merge the 334 unreleased `origin/main` commits.** v0.23.3 is still the newest release; of the 334,
+**0** touch the compression core (`agent/`), **0** touch the session store, and only 2 touch the kanban
+path (both cosmetic "Kanban wake" UX fixes). The v0.23.3 merge cost 24 hand-resolved conflicts; there is
+no defect here that it would fix.
+
+**PCI topology — corrected (verified from `lspci -D -t` + `nvidia-smi`):**
+
+| GPU | PCI | root port | link | device id |
+|---|---|---|---|---|
+| 0 (main) | `01:00.0` | `00:01.0` | x16 | `10de:2503` |
+| 1 | `03:00.0` | **`00:1a.0`** | x4 | `10de:2504` (**Lite Hash Rate**) |
+| 2 | `06:00.0` | `00:1c.4` | x4 | `10de:2503` |
+| 3 | `08:00.0` | **`00:1d.7`** | **x1** (M.2_2 riser) | `10de:2503` |
+
+The card that fell off the bus (Xid 79) was **GPU3 on `00:1d.7`**, not `00:1a.0`. After the reseat +
+reboot: `00:1d.7` AER counters read **0**, `00:1a.0` reads **1 RxErr** — GPU1's link is still the
+marginal one, and the 10,935-vs-9,247 "AER" figures in the earlier notes are **two different
+instruments** (a journal-line count vs the sysfs `aer_dev_correctable` sums) — never trend them together.
+
+**Pushed:** `tataetae/Strata` branch `clara/hermes-state` → `bec86ad87` (the tools with the COMMIT CHECK,
+the live 4-GPU profile, the systemd drop-ins, the notes). `tataetae/hermes-agent` `clara/v0.23.3-merge`
+is unchanged.
 
 ## Rules
 - Old disks stay read-only. Never expose 8647/9119 beyond the LAN without auth.

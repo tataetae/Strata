@@ -1,33 +1,79 @@
 #!/bin/bash
-# Stop the summariser batch if the ENGINE is genuinely down.
-# /health TIMES OUT UNDER LOAD, so require 3 CONSECUTIVE failed probes.
+# The summariser batch's watchdog.
+#
+# WHY THIS IS STRICT: the first version stopped the batch after a SINGLE 10 s
+# /health timeout, on a perfectly healthy engine that answered in 0.00 s the
+# moment after (the engine was mid-prefill on a 300k-token prompt). A busy
+# engine legitimately times out on /health - that is the engine working, not
+# failing. v2 needed 3 consecutive failures.
+#
+# v3 (Boxcat's rule, accepted): a /health failure only counts when the engine
+# PROCESS IS ALSO GONE. So the batch is stopped only when the engine unit is
+# inactive - i.e. the engine really died - or when the host itself is in
+# trouble (PSI memory avg10 > 40, or MemAvailable < 2 GiB).
+#
+# It never stops the batch just because the batch finished, and it never stops
+# it for a single timeout, however many.
+#
+# Log: /tmp/opencode/watchdog.log
+
 LOG=/tmp/opencode/watchdog.log
+BATCH_PROG='batch_run2[.]py'
+ENGINE_UNIT=strata-iq3s-server
+HEALTH_URL=http://127.0.0.1:8080/health
+PROBE_TIMEOUT=8
+NEEDED=3
+PSI_LIMIT=40
+MEMAVAIL_LIMIT_MIB=2048
+
+log() { echo "$(date -u '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"; }
+
+batch_alive() { pgrep -f "$BATCH_PROG" >/dev/null 2>&1; }
+
 consec=0
+log "watchdog v3 started (engine-process rule, PSI>$PSI_LIMIT, MemAvailable<${MEMAVAIL_LIMIT_MIB}MiB)"
+
 while true; do
-  sleep 240
-  ts=$(date -u +%H:%M:%S)
-  body=$(curl -sS -m 8 http://127.0.0.1:8080/health 2>/dev/null)
-  if echo "$body" | grep -q '"loaded":true'; then ok=1; consec=0; else ok=0; consec=$((consec+1)); fi
-  mem=$(awk '/MemAvailable/{printf "%d",$2/1024}' /proc/meminfo)
-  psi=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){split($i,a,"=");print a[2]; exit}}' /proc/pressure/memory)
-  batch=$(pgrep -cf 'batch_run2[.]py' 2>/dev/null || echo 0)
-  echo "$ts health=$ok consec_fail=$consec memavail=${mem}MiB psi_avg10=${psi:-?} batchprocs=$batch" >> "$LOG"
-  if [ "$batch" = "0" ]; then
-    echo "$ts batch not running -> the watchdog exits" >> "$LOG"; exit 0
-  fi
-  if [ "$consec" -ge 3 ]; then
-    echo "$ts 3 CONSECUTIVE health failures -> stopping the batch" >> "$LOG"
-    pkill -f 'batch_run2[.]py' 2>/dev/null; pkill -f 'run_compress[.]sh' 2>/dev/null
-    exit 0
-  fi
-  if awk -v p="${psi:-0}" 'BEGIN{exit !(p>40)}' 2>/dev/null; then
-    echo "$ts PSI memory avg10=$psi -> stopping the batch" >> "$LOG"
-    pkill -f 'batch_run2[.]py' 2>/dev/null; pkill -f 'run_compress[.]sh' 2>/dev/null
-    exit 0
-  fi
-  if [ "${mem:-0}" -lt 2000 ]; then
-    echo "$ts MemAvailable ${mem}MiB < 2 GiB -> stopping the batch" >> "$LOG"
-    pkill -f 'batch_run2[.]py' 2>/dev/null; pkill -f 'run_compress[.]sh' 2>/dev/null
-    exit 0
-  fi
+    if ! batch_alive; then
+        log "the batch is gone - the watchdog exits"
+        exit 0
+    fi
+
+    # 1. the engine's own liveness: the systemd unit, not a curl
+    engine_state=$(systemctl is-active "$ENGINE_UNIT" 2>/dev/null)
+    engine_pid=$(systemctl show "$ENGINE_UNIT" -p MainPID --value 2>/dev/null)
+
+    # 2. the /health probe
+    if timeout "$PROBE_TIMEOUT" curl -sS -o /dev/null -f "$HEALTH_URL" 2>/dev/null; then
+        consec=0
+    else
+        consec=$((consec + 1))
+    fi
+
+    # 3. the host's pressure
+    psi=$(awk '/^some/ {print $2}' /proc/pressure/memory 2>/dev/null | cut -d= -f2 | cut -d' ' -f1)
+    memavail=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
+
+    if [ "$consec" -ge "$NEEDED" ] && [ "$engine_state" != "active" ]; then
+        log "STOP the batch: /health failed ${consec}x AND the engine unit is '${engine_state}' (pid '${engine_pid}')"
+        pkill -f "$BATCH_PROG" 2>/dev/null
+        log "the batch was stopped"
+        exit 0
+    fi
+
+    psi_int=${psi:-0}
+    mem_int=${memavail:-0}
+    if [ "$psi_int" -gt "$PSI_LIMIT" ]; then
+        log "STOP the batch: PSI memory avg10=$psi_int (>$PSI_LIMIT)"
+        pkill -f "$BATCH_PROG" 2>/dev/null
+        exit 0
+    fi
+    if [ "$mem_int" -lt "$MEMAVAIL_LIMIT_MIB" ]; then
+        log "STOP the batch: MemAvailable=${mem_int}MiB (<${MEMAVAIL_LIMIT_MIB}MiB)"
+        pkill -f "$BATCH_PROG" 2>/dev/null
+        exit 0
+    fi
+
+    log "ok engine=${engine_state} pid=${engine_pid} consec_fail=${consec}/${NEEDED} psi=${psi_int} mem=${mem_int}MiB"
+    sleep 60
 done
