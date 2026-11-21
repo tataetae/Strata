@@ -36,6 +36,7 @@ for i, r in enumerate(BATCH, 1):
     status = 'failed'
     for line in out.splitlines():
         if 'status=' in line: status = line.split('status=')[1].split()[0]
+        if 'FALSE SUCCESS' in line: status = 'false_success'
         if 'FAILED' in line: status = 'failed'
     dt = time.time() - t0
     if status == 'compressed':

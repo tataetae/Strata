@@ -72,7 +72,7 @@ async def compress_session(profile_home: str, session_id: str, focus: str = ""):
         history.append(m)
 
     runtime = dict(
-        provider=provider, base_url=base_url, api_key=STRATA_KEY, api_mode='chat_completions',
+        provider=provider, base_url=base_url, api_key=_strata_key(), api_mode='chat_completions',
         reasoning_config={'enabled': True, 'effort': 'none'},
     )
     request = parse_compress_args(focus)
@@ -99,17 +99,25 @@ async def compress_session(profile_home: str, session_id: str, focus: str = ""):
             for line in render_compress_result(result):
                 log("    %s" % line)
             return result.status
-        after = result.after_messages
-        # commit: the compression core already persisted the archive + the rotated child
-        # (in-place or rotated). Verify the DB reflects it.
+        # COMMIT CHECK: the tool must VERIFY the database actually changed before
+        # reporting success. result.status only says the summariser ran; only the DB says
+        # the archive landed. A "compressed" report with compacted=0 rows is a FALSE
+        # SUCCESS (13 sessions were reported compressed and never were).
         new_id = db.read(
             "select id, parent_session_id, end_reason from sessions where id=? or parent_session_id=?",
             (session_id, session_id))
         live = db.read(
             "select count(*) from messages where session_id=? and active=1", (session_id,))[0][0]
+        compacted_rows = db.read(
+            "select count(*) from messages where session_id=? and compacted=1", (session_id,))[0][0]
+        rotated = [r for r in new_id if r[0] != session_id]
         log("  after: %d messages in the live session (was %d)" % (live, len(msgs)))
+        log("  COMMIT CHECK: compacted_rows=%d rotated_children=%d" % (compacted_rows, len(rotated)))
         for r in new_id:
             log("    session %s parent=%s end=%s" % (r[0][:40], r[1], r[2]))
+        if compacted_rows == 0 and not rotated:
+            log("  !! FALSE SUCCESS: the summariser ran but nothing was archived or rotated.")
+            return "false_success"
         return "compressed"
     except Exception as e:
         log("  !! FAILED: %s" % e)
