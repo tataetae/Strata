@@ -988,6 +988,55 @@ instruments** (a journal-line count vs the sysfs `aer_dev_correctable` sums) —
 the live 4-GPU profile, the systemd drop-ins, the notes). `tataetae/hermes-agent` `clara/v0.23.3-merge`
 is unchanged.
 
+## 2026-11-21 09:30 → 09:50 — the dashboards: two boot-time regressions and a noisy alert
+
+The owner asked to check the dashboard and update them too. The **Hermes dashboard is healthy**
+(`/api/status`: v0.23.3, gateway running, api_server + hermex connected, 18 profiles, 4 active agents),
+but the health sheets underneath it were reporting real regressions that the reboot had caused.
+
+**1. THP was `never` — a boot-time race between two units.** `health_check.sh` WARNed "THP = never".
+Cause: **`thp-always.service` (created 2026-11-19) and `crash-mitigate.service` (created 2026-11-11,
+"THP off + zswap off — kernel mm corruption test") both write
+`/sys/kernel/mm/transparent_hugepage/enabled`, and neither ordered itself against the other.** At the
+06:33 boot, `crash-mitigate` ran at 06:33:30 and `thp-always` at 06:33:29 — so the mitigation won by one
+second and THP stayed `never`. That costs the engine the measured **−10 % cold prefill and −45 % park
+time** (AGENTS.md, 2026-11-19). Fixed: `thp-always.service` now carries `After=crash-mitigate.service`
+(backup `thp-always.service.bak-20261121T0940`), and THP is `always` again.
+**The mitigation never worked anyway:** the crashes it was chasing are 2026-11-14 06:08 (diagnosed as
+the ICU/locale problem, not mm corruption) and 2026-11-17 14:35 — and 11-14/11-17 both happened *with*
+THP off.
+
+**2. Swap was 112 GiB, not 278 GiB — `swapfile4` was never re-enabled.** `/srv/inference/swap/swapfile4`
+(160 GiB) exists on disk but was only `swapon`ned by hand, so the reboot dropped it: the kernel saw
+`SwapTotal = 114,687 MiB` while the notes said 278 GiB. That matters because the engine's parking
+admission counts free swap as headroom (`STRATA_PARK_SWAP_GIB=256`). Fixed: `swapon` + a
+`/etc/fstab` line (backup `fstab.bak-20261121T0940-swapfile4`) → **278,527 MiB, 251 GiB free**.
+
+**3. The health API alerted on a hot GPU with no throttle behind it.** It fired "GPU 0 temperature is
+high at 80 C" and flipped the whole host to `degraded` — but 80 C is **normal** for an RTX 3060 under a
+200k-token prefill, and `nvidia-smi -q -d PERFORMANCE` reported **no active throttle reason** at all.
+The rule now asks for `clocks_event_reasons.sw_thermal_slowdown` and alerts at **85 C, or at 80 C only
+when the card is actually throttling** (`hermes_health_api_wsl.py`, backup
+`*.bak-pre-gpu-thermal-rule-20261121T0945`; the field is exposed as `gpu.devices[].thermal_slowdown`).
+
+**4. `HEALTH-CHECKLIST.md` was rewritten** — it was the 11-19 sheet and every number in it was stale:
+the expert cache (19,370 MiB / 6,450 slots → **25,842 MiB / 11,096**), the prompt chunk (6144 → **6912**),
+the log file (`strata-iq3_xxs.log` → **`strata-iq4xs.log`**), the cgroup (`high 100 / max 112` →
+**80 / 136 GiB**), the decode threshold (CPU < 30 ms/window → **< 6 ms**, because `--kv-resident` moved
+the K/V to RAM), and the dispatcher ("runs in hermes-dashboard" → it runs in the **gateway** since
+v0.23.3). New rows: THP (3.7), the swap files (3.8), the dispatcher's allowlist (4.7), the dashboard's
+own API (4.8), the Hindsight model name (5.5) and the batch's commit check (6.5).
+
+**Watch item: CUDA0's VRAM.** The main card carries the head + the MTP drafters, so it has the least
+headroom — **440 MiB free today** (GPU1 893, GPU2 625, GPU3 651). The engine reports
+`vram_free_mib 1038` and the log shows **"--vram-elastic is off: a layer split has a cache per GPU"**, so
+the reserve cannot be given back dynamically. `--vram-reserve-mib 1024` is the floor (512 produced
+`cuBLAS status 14` at 19 MiB free on CUDA3). Below ~100 MiB free on CUDA0 the next thing to try is
+`--kv-resident 20480` (frees the K/V ring's VRAM into expert slots).
+
+**Both health sheets now pass:** `health_check.sh` **22 pass / 0 warn / 0 fail**,
+`hermes_health_check.sh` **20 pass / 0 warn / 0 fail**.
+
 ## Rules
 - Old disks stay read-only. Never expose 8647/9119 beyond the LAN without auth.
 - Don't send external messages on the owner's behalf. Don't delete the only copy of anything.

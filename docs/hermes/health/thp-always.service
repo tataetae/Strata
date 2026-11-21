@@ -1,0 +1,22 @@
+[Unit]
+Description=Transparent huge pages for all anonymous memory (Strata's arena and the conversation-cache snapshots)
+Documentation=https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md
+DefaultDependencies=no
+After=sysinit.target crash-mitigate.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The engine already madvises its expert arena; this extends the same 2 MiB pages to
+# the rest of its anonymous memory - above all the conversation-cache snapshots it
+# copies on every park (measured: park time 125.8 ms -> 68.7 ms, cold prefill -10 %).
+# defrag stays "madvise", so only madvised regions ever compact synchronously and the
+# CPU (the engine's expert path) is not stalled by compaction.
+ExecStart=/bin/sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled'
+# Revert: ExecStart=/bin/sh -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
