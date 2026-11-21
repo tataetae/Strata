@@ -1037,6 +1037,32 @@ the reserve cannot be given back dynamically. `--vram-reserve-mib 1024` is the f
 **Both health sheets now pass:** `health_check.sh` **22 pass / 0 warn / 0 fail**,
 `hermes_health_check.sh` **20 pass / 0 warn / 0 fail**.
 
+## 2026-11-21 09:55 — OWNER: "stop all background tasks" (the engine is reserved for the owner's chat)
+
+The owner was engaging with **@hermes (root)** and **@system-maintainer (Boxcat)** and asked to stop
+everything background. **What was hammering the engine:** the summariser batch (each compaction is a
+~50k-token prefill on a 240k conversation), 16 enabled cron jobs, 2 p14 kanban workers, and the root
+bot's own "W1" workstream. Everything below is **stopped and reversible**:
+
+| what | how it was stopped | how to resume |
+|---|---|---|
+| the summariser batch (`batch_run2.py` + its child + the watchdog) | killed (PID 110310/110311/148299/115088) | `python /tmp/opencode/batch_run2.py` — it **skips anything that already has a compacted row**, so nothing is repeated. It stopped at **8/24** |
+| **every cron in every profile: 39 jobs, 0 enabled** | `hermes cron pause <id>` per job (root 8, system-maintainer 8, cad 1) | `hermes cron resume <id>` (with `HERMES_HOME=<profile home>`) |
+| the p14 cards `t_7cdf55f7` (B8) + `t_6db82a96` (F8) | `hermes kanban reclaim` → `hermes kanban block` → they landed in **triage** ("unblock loop detected"), so the dispatcher has nothing to spawn | `hermes kanban unblock <id>` — the dispatcher re-runs them within 60 s |
+| the only dispatchable card on any board (`t_424bb60a`, h2o2 SPA bind) | `hermes kanban --board h2o2 schedule` — **a `todo` card cannot be `blocked`, only `scheduled`**, and Scheduled cards are not dispatched | `hermes kanban --board h2o2 unschedule <id>` (or block with `--kind needs_input`) |
+| the root bot's W1 workstream | the "stop all background work" message was delivered to the root bot (`runtime/bot_live_delivery`, `status=queued` → claimed at its next turn boundary); W1 was a read-only check and finished on its own | — |
+
+**Do NOT use `hermes pause` for this.** It halts **new gateway turns** too, so the owner's own chat with
+@hermes and @system-maintainer would come back "Hermes is paused" — the opposite of what they wanted.
+
+**Why the dispatcher is safe to leave running:** `kanban.dispatch_profiles` is absent (= "any"), the
+dispatcher ticks every 60 s in the **gateway**, and it only spawns cards in `ready`/`todo`/`running`.
+With 0 dispatchable cards it has nothing to do. A card that flips back to `todo` on its own (e.g. a
+dependency re-opening) would spawn a worker again — that is the one thing to watch.
+
+**Final state:** engine `queued=0`, **0 requests in 180 s**, 3 slots free for the owner's chat,
+conversation cache parked 23 / **evictions 0** / 3.99 M tokens reused.
+
 ## Rules
 - Old disks stay read-only. Never expose 8647/9119 beyond the LAN without auth.
 - Don't send external messages on the owner's behalf. Don't delete the only copy of anything.
