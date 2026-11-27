@@ -360,9 +360,13 @@ public:
     int64_t prefetch(const std::vector<int32_t>& prompt) const {
         size_t best_i = SIZE_MAX;
         int64_t best_n = 0;
+        // The hint carries only the FIRST few thousand tokens of the prompt (a control line of the
+        // whole 300k-token prompt would be megabytes), so the match is on the common prefix: the
+        // entry whose tokens agree with the hint's for as long as possible wins.  A hint that
+        // agrees for fewer than 64 tokens is not a conversation at all and is ignored.
         auto prefix_len = [&](const std::vector<int32_t>& ids) -> int64_t {
-            const size_t n = ids.size();
-            if (n == 0 || n > prompt.size()) return 0;
+            const size_t n = std::min(ids.size(), prompt.size());
+            if (n < 64) return 0;
             for (size_t k = 0; k < n; ++k) if (ids[k] != prompt[k]) return 0;
             return (int64_t)n;
         };
