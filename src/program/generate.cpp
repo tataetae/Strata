@@ -14837,9 +14837,13 @@ int main(int argc, char** argv) {
                 const auto t_pre = Clock::now();
                 int64_t held = 0;
                 if (!pre_ids.empty()) held = conversations.prefetch(pre_ids);
-                std::printf("PRED %lld %lld %.1f\n", (long long)held, (long long)pre_ids.size(),
+                // stderr, not stdout: stdout is the CONTROL channel (the serve layer reads the
+                // request's lines from it), so an answer there would land in a request's line queue.
+                std::fprintf(stderr, "strata serve: conversation cache: prefetched %lld tokens of a parked "
+                            "conversation for a waiting request (%lld prompt tokens) in %.1f ms\n",
+                            (long long)held, (long long)pre_ids.size(),
                             std::chrono::duration<double, std::milli>(Clock::now() - t_pre).count());
-                std::fflush(stdout);
+                std::fflush(stderr);
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) {   // for a prompt read that has ended meanwhile
