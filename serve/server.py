@@ -3317,34 +3317,30 @@ _BUS_SCORE: dict = {}
 
 def gpu_list(cfg: dict) -> list[int]:
     """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
-<<<<<<< HEAD
-    numbers them; [] when it names none."""
+    numbers them; [] when it names none.  With --prefill-main the card with the widest PCIe link goes
+    FIRST: the whole batched prompt runs on the first card, so the faster its bus the faster every prompt
+    (upstream: 1520 t/s with the wide-link card first, 890 with the narrow one).  Without the flag the
+    order is left alone - it is the decode's business (the fastest card holds the head and the drafter)."""
     roles, _ = gpu_roles.saved_roles(cfg)       # "gpu_roles" (Main / Helper / Off per card) wins unless "gpu" was edited by hand
     if roles is not None:
         legacy = _gpu_numbers(cfg.get("gpu"))
-        return legacy if legacy else gpu_roles.engine_order(roles)     # Main LAST; Off cards left out; [] when every card is Off
-    return _gpu_numbers(cfg.get("gpu"))
+        gpus = legacy if legacy else gpu_roles.engine_order(roles)     # Main LAST; Off cards left out; [] when every card is Off
+    else:
+        gpus = _gpu_numbers(cfg.get("gpu"))
+    if len(gpus) > 1 and "--prefill-main" in (cfg.get("args") or []):
+        scored = sorted(gpus, key=lambda i: -_gpu_bus_score(i))
+        if scored != gpus:
+            print(f"[strata] GPU order by PCIe link (--prefill-main): {scored} (the config named {gpus})", flush=True)
+        gpus = scored
+    return gpus
 
 
 def _gpu_numbers(g) -> list[int]:
-=======
-    numbers them; [] when it names none.  With several, the card with the widest PCIe link goes FIRST: the
-    main device (CUDA0) streams the whole expert arena through the prompt path and hands the later layers to
-    the stages, so the faster its bus the faster every prompt (measured on this rig: a Gen5 x8 internal card
-    as main prefill 1339 t/s vs 890 with the Gen4 x4 eGPU box as main).  Equal scores keep the written order."""
-    g = cfg.get("gpu")
->>>>>>> 1cce9b4 (Order a split's GPUs by PCIe link: the widest link is CUDA0)
     if g is None or g == "":
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
-    gpus = [int(str(x).strip()) for x in items if str(x).strip() != ""]
-    if len(gpus) > 1:
-        scored = sorted(gpus, key=lambda i: -_gpu_bus_score(i))
-        if scored != gpus:
-            print(f"[strata] GPU order by PCIe link: main = nvidia-smi {scored[0]} "
-                  f"(score {_gpu_bus_score(scored[0])}; the config named {gpus})", flush=True)
-        gpus = scored
-    return gpus
+    return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+
 
 
 def gpu_roles_active(cfg: dict) -> bool:
