@@ -344,7 +344,6 @@ public:
     /// restore itself becomes a RAM-speed copy (measured 0.4-3 s).
     ///
     /// Returns the number of tokens the matching entry holds (0 when nothing matches).
-    template<class Token>
     /// Touch the parked conversation this prompt would resume, so the restore is a RAM-speed copy.
     ///
     /// The K/V of a parked conversation is anonymous memory; when the engine's cgroup is over its
