@@ -79,6 +79,10 @@ inline int64_t auto_conversation_cache_mib(std::optional<uint64_t> available, in
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
+// Free swap from the same /proc/meminfo read (SwapFree).  The park gate samples MemAvailable, which
+// excludes swap by definition; STRATA_PARK_SWAP_GIB uses this to count free swap as headroom.
+std::optional<uint64_t> conversation_swap_free(std::istream& meminfo);
+
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
     return available && *available >= floor && allocation <= *available - floor;
