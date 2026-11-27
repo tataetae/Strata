@@ -108,6 +108,20 @@ public:
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) const {
         return visit_impl(*this, offset, count, fn);
     }
+    /// Touch every page of the buffer, so a page the kernel has swapped out is read back in.
+    ///
+    /// A parked conversation's K/V is anonymous memory: when the engine's cgroup is over its high,
+    /// the kernel writes the cold snapshots to the NVMe swap, and a restore then pays a scattered
+    /// 4 KiB page-in at ~240 MB/s instead of RAM speed.  Touching the pages WHILE the request is
+    /// still waiting for a slot overlaps that page-in with the wait, so the restore itself is a
+    /// RAM-speed copy.  The read is one byte per page: the kernel faults the whole page in.
+    void prefetch_pages() const {
+        static volatile uint8_t sink = 0;
+        visit(0, size(), [](const uint8_t* p, size_t n, size_t) {
+            for (size_t i = 0; i < n; i += 4096) sink = static_cast<uint8_t>(sink + p[i]);
+            return true;
+        });
+    }
     bool read(void* target, size_t offset, size_t count) const {
         return visit(offset, count, [&](const uint8_t* p, size_t n, size_t at) {
             std::memcpy(static_cast<uint8_t*>(target) + at - offset, p, n);

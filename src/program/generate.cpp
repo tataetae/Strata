@@ -14818,6 +14818,30 @@ int main(int argc, char** argv) {
                 if (cr.slot >= 0 && cr.slot < (int) bs.size() && cr.ids.size() >= 3) co_pending.push_back(std::move(cr));
                 continue;
             }
+            if (line.rfind("PRE ", 0) == 0) {
+                // PRE <id,id,...>: the prompt of a request that is WAITING for a slot.  The parked
+                // conversation it will resume is touched now, so its pages come back from the NVMe swap
+                // while the request waits instead of during the restore: the restore of a 213k-token
+                // conversation measured 26-31 s when the snapshot was on the swap and 0.4-3 s when it
+                // was still in RAM.
+                std::vector<int32_t> pre_ids;
+                for (const char* q = line.c_str() + 4; q != nullptr && *q != '\0';) {
+                    while (*q == ' ' || *q == ',') ++q;
+                    if (*q == '\0') break;
+                    char* e2 = nullptr;
+                    const long long v = std::strtoll(q, &e2, 10);
+                    if (e2 == q) { pre_ids.clear(); break; }
+                    pre_ids.push_back((int32_t)v);
+                    q = e2;
+                }
+                const auto t_pre = Clock::now();
+                int64_t held = 0;
+                if (!pre_ids.empty()) held = conversations.prefetch(pre_ids);
+                std::printf("PRED %lld %lld %.1f\n", (long long)held, (long long)pre_ids.size(),
+                            std::chrono::duration<double, std::milli>(Clock::now() - t_pre).count());
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("BYIELD", 0) == 0) {   // for a prompt read that has ended meanwhile
                 if (trace && piped)
                     std::fprintf(stderr, "strata trace: BYIELD dropped, %d groups in flight\n",

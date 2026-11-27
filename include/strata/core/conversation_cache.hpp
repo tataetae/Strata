@@ -237,6 +237,21 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+/// Touch every page of a byte vector (the kernel faults the whole page in on the read).
+inline void prefetch_bytes(const std::vector<uint8_t>& v) {
+    static volatile uint8_t sink = 0;
+    for (size_t i = 0; i < v.size(); i += 4096) sink = static_cast<uint8_t>(sink + v[i]);
+}
+
+/// The same for a checkpoint's running state (its GDN rows and the small side tables).
+inline void prefetch_checkpoint(const ConversationCheckpoint& c) {
+    prefetch_bytes(c.gdn);
+    prefetch_bytes(c.ple);
+    prefetch_bytes(c.tails);
+    prefetch_bytes(c.dead);
+    prefetch_bytes(c.block_pos);
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -320,7 +335,72 @@ public:
         return best;
     }
 
-    /// A parked conversation holds this state already (its live tokens or one of its checkpoints start with `ids`,
+    /// Touch the parked conversation this prompt would resume, so the restore is a RAM-speed copy.
+    ///
+    /// The K/V of a parked conversation is anonymous memory; when the engine's cgroup is over its
+    /// high the kernel writes the cold snapshots to the NVMe swap and the restore pays a scattered
+    /// 4 KiB page-in at ~240 MB/s (measured 26-31 s for a 213k-token conversation).  Called when a
+    /// request is QUEUED - before it waits for a slot - the page-in overlaps the wait and the
+    /// restore itself becomes a RAM-speed copy (measured 0.4-3 s).
+    ///
+    /// Returns the number of tokens the matching entry holds (0 when nothing matches).
+    template<class Token>
+    /// Touch the parked conversation this prompt would resume, so the restore is a RAM-speed copy.
+    ///
+    /// The K/V of a parked conversation is anonymous memory; when the engine's cgroup is over its
+    /// high the kernel writes the cold snapshots to the NVMe swap and the restore pays a scattered
+    /// 4 KiB page-in at ~240 MB/s (measured 26-31 s for a 213k-token conversation, 0.4-3 s when the
+    /// snapshot was still in RAM).  Called when a request is QUEUED - before it waits for a slot -
+    /// the page-in overlaps the wait and the restore itself becomes a RAM-speed copy.
+    ///
+    /// The match is on the TOKENS alone (the longest parked prefix of the prompt): a prefetch only
+    /// has to bring the right pages back, and a close match still warms what matters.  The images
+    /// are not compared, so a chat with pictures still warms its conversation.
+    ///
+    /// Returns the number of tokens the matching entry holds (0 when nothing matches).
+    int64_t prefetch(const std::vector<int32_t>& prompt) const {
+        size_t best_i = SIZE_MAX;
+        int64_t best_n = 0;
+        auto prefix_len = [&](const std::vector<int32_t>& ids) -> int64_t {
+            const size_t n = ids.size();
+            if (n == 0 || n > prompt.size()) return 0;
+            for (size_t k = 0; k < n; ++k) if (ids[k] != prompt[k]) return 0;
+            return (int64_t)n;
+        };
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            const SavedConversation& e = entries_[i];
+            const int64_t n = prefix_len(e.live.ids);
+            if (n > best_n) { best_n = n; best_i = i; }
+            for (const ConversationCheckpoint& c : e.checkpoints) {
+                const int64_t cn = prefix_len(c.ids);
+                if (cn > best_n) { best_n = cn; best_i = i; }
+            }
+        }
+        if (best_i == SIZE_MAX || best_n <= 0) return 0;
+        const SavedConversation& e = entries_[best_i];
+        for (const ConversationKv& k : e.kv) {
+            k.k.prefetch_pages();
+            k.v.prefetch_pages();
+            k.k_scale.prefetch_pages();
+            k.v_scale.prefetch_pages();
+            k.pooled.prefetch_pages();
+        }
+        for (const ConversationCheckpoint& c : e.checkpoints) prefetch_checkpoint(c);
+        prefetch_checkpoint(e.live);
+        for (const SavedConversation& s : e.stage_images) {
+            for (const ConversationKv& k : s.kv) {
+                k.k.prefetch_pages();
+                k.v.prefetch_pages();
+                k.k_scale.prefetch_pages();
+                k.v_scale.prefetch_pages();
+                k.pooled.prefetch_pages();
+            }
+        }
+        return best_n;
+    }
+
+    
+/// A parked conversation holds this state already (its live tokens or one of its checkpoints start with `ids`,
     /// same pictures, same steering): see conversation_covers.  Read-only; no LRU effect.
     template<class Token>
     bool holds(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const {

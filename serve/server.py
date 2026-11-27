@@ -1659,6 +1659,25 @@ class StrataEngine:
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
+    def _send_prefetch(self, prompt) -> None:
+        """Tell the engine which parked conversation this request will resume, BEFORE it waits.
+
+        The parked conversation's K/V is anonymous memory; when the engine's cgroup is over its
+        high the kernel writes the cold snapshots to the NVMe swap, and a restore then pays a
+        scattered 4 KiB page-in at ~240 MB/s (measured 26-31 s for a 213k-token conversation against
+        0.4-3 s when the snapshot was still in RAM).  The engine touches the pages of the matching
+        entry when it reads this line, so the page-in overlaps the wait for a slot and the restore
+        itself is a RAM-speed copy.
+
+        Best effort: a failure here must not fail the request.
+        """
+        if not prompt:
+            return
+        try:
+            self._send("PRE " + ",".join(str(int(t)) for t in prompt))
+        except Exception:
+            pass
+
     def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
@@ -2163,6 +2182,7 @@ class StrataEngine:
                         # With none free the control lines are given back while waiting: a slot can be held by a read
                         # that gave way (BYIELD) and needs them to go on, so waiting with them is a deadlock - long,
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
+                        prefetched = False
                         while True:
                             deadline = getattr(cancel, "_strata_queue_deadline", None)
                             if deadline is not None and time.monotonic() >= deadline:
@@ -2182,6 +2202,9 @@ class StrataEngine:
                                 if not admit_wait:          # #1603: counted while it waits for a slot (it holds no
                                     admit_wait, admit_since = True, time.monotonic()   # control lines then)
                                     self.admitting += 1
+                            if not prefetched:
+                                prefetched = True
+                                self._send_prefetch(prompt)   # the parked copy comes back while we wait
                             if holding:
                                 self.ctl.release()
                                 holding = False
@@ -6811,23 +6834,69 @@ class LogprobEntries:
             e["logprob"] = own["logprob"]           # (it used to copy the first alternative's, another token's)
         return e
 
-def prompt_progress(svc: Service):
+def prompt_progress(svc: Service, req_total=None):
     """The last PP line as llama.cpp's `prompt_progress`, so a client written for llama.cpp reads both servers: the
     same four fields, `time_ms` elapsed since prompt reading started, and `processed` counting from token 0 so that a
     client takes the reused prefix out with `cache` (llama.cpp's rule: the timed progress is
     `(processed-cache)/(total-cache)`).  None when there is nothing to say: no PP yet, or the line that says the prompt
-    is read.  An engine too old to print RESUME gives `cache` 0, which only makes a reused prefix count as work."""
+    is read.  An engine too old to print RESUME gives `cache` 0, which only makes a reused prefix count as work.
+
+    WITH --batch the engine's progress line is GLOBAL: the PP line is printed per request but carries no request id, so
+    the last one wins.  The line is therefore only THIS request's progress when its total matches the request's own
+    prompt size; otherwise it is returned marked `global` — still a sign of life (the engine is reading), but not a
+    percentage this chat may quote.  Before this, a --batch server answered `return_progress` with silence, so the
+    client's stall timer killed a healthy 250k-token prefill as if the endpoint had died.
+    """
     engine = svc.engine
-    if getattr(engine, "batch", 0):      # --batch: the engine's progress is one global line, not this request's
-        return None
     progress = getattr(engine, "progress", None)
     if not progress:
         return None
     read, total = progress
     if total <= 0 or total - read <= PP_DONE_TAIL:
         return None
-    return {"total": int(total), "cache": int(getattr(engine, "reused", 0) or 0), "processed": int(read),
-            "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
+    out = {"total": int(total), "cache": int(getattr(engine, "reused", 0) or 0), "processed": int(read),
+           "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
+    if getattr(engine, "batch", 0) and req_total is not None and int(total) != int(req_total):
+        out["global"] = True
+    return out
+
+
+def _req_total(ids) -> int | None:
+    """The request's own prompt size in tokens (None when it cannot be told).
+
+    The engine's PP line carries the prompt's total; under --batch it is the LAST request's, so
+    comparing the two is what tells a client whether the progress it is shown is its own.
+    """
+    if ids is None:
+        return None
+    try:
+        return int(len(ids))
+    except TypeError:
+        return None
+
+
+def queue_view(svc: Service) -> dict:
+    """The engine's queue, as the client sees it: how many requests wait for a slot, and what the slots hold.
+
+    A client that knows the queue can tell the user WHY it is waiting ("6 requests ahead of you")
+    instead of showing a spinner for minutes.  Cheap: the counters are already there.
+    """
+    engine = svc.engine
+    try:
+        slots = engine.slots_view() if hasattr(engine, "slots_view") else []
+    except Exception:
+        slots = []
+    busy = sum(1 for s in slots if s.get("state") != "idle")
+    running = 0
+    try:
+        with svc.status_lock:
+            running = len(svc.live_reqs)
+    except Exception:
+        pass
+    return {"waiting": int(getattr(engine, "waiting", 0) or 0),
+            "running": int(running),
+            "slots": int(busy),
+            "total_slots": int(getattr(engine, "batch", 0) or 0)}
 
 
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
@@ -6858,8 +6927,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
-            pp = prompt_progress(svc) if want_progress else None
-            yield None if pp is None else {**chunk({}), "prompt_progress": pp}
+            pp = prompt_progress(svc, _req_total(ids)) if want_progress else None
+            yield None if pp is None else {**chunk({}), "prompt_progress": pp, "queue": queue_view(svc)}
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -8087,6 +8156,11 @@ def make_handler(svc: Service):
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
+                     # a client asks for prompt-progress chunks with return_progress: true; the PP line the
+                     # engine prints while it reads a long prompt becomes one.  A client that knows this
+                     # keeps its stall timer quiet during a multi-minute prefill (and can show the
+                     # percentage) instead of killing a healthy request.
+                     "prompt_progress": True,
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
