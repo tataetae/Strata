@@ -3,6 +3,18 @@
 Everything needed to rebuild this box's Hermes setup after a reset.
 Written 2026-11-21, after the v0.23.3 merge and the GPU3 hardware failure.
 
+## The branches on the fork (tataetae/Strata)
+
+| branch | what it is |
+|---|---|
+| `clara/engine-0.1.56` | **the live engine's source of record**: the 0.1.56 tree, self-consistent (its C++ prefetch AND its serve layer), the tree the binary is built from |
+| `clara/prefill-main` | the **live tree's serve layer** (the 0.1.52 checkout that runs on the box: the prompt-progress chunks, the queue view, the prefetch hint) |
+| `clara/hermes-state` | **this directory**: the state, the record, the tooling |
+
+**The box runs a mix**: the 0.1.56 C++ binary (`strata-src/engine/strata`) with the 0.1.52 tree's
+Python serve layer (`strata-src/serve/server.py`). Both halves carry the 27 November changes; a
+rebuild from `clara/engine-0.1.56` alone gives a consistent tree.
+
 ## What this directory holds
 
 | file | what it is |
