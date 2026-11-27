@@ -14,16 +14,57 @@ Written 2026-11-21, after the v0.23.3 merge and the GPU3 hardware failure.
 | `systemd/*.conf` | the drop-ins that put the services on the Python 3.14 runtime |
 | `hermes-hindsight.env` | the Hindsight service env (the LLM model is now the live build) |
 
-## The current state (2026-11-21 05:15 UTC)
+## The current state (2026-11-27 11:10 UTC)
 
 | | |
 |---|---|
-| Hermes | **0.23.3** (sha `33cbdad2ef`), 18 profiles, api_server + hermex connected |
-| Engine | Strata UD-IQ4_XS on **3 of 4 GPUs**, 7,244 expert slots, chunk 6,400 |
-| Conversation cache | `--conversation-cache-slots 128`, **evictions 0**, 14 parked, 17.9 GiB of a 256 GiB budget |
-| Memory | MemAvailable ~14 GiB, PSI memory avg10 0.00, swap 18 of 278 GiB (all NVMe) |
-| Throughput | warm continuation **0.8–1.6 s TTFT**, 8–11 s end-to-end through Hermes |
-| Health | `logs/health_check.sh` 22 pass / 0 fail · `logs/hermes_health_check.sh` 20 pass / 0 fail |
+| Hermes | **0.23.3** (sha `33cbdad2ef` + the progress/queue work), 18 profiles, api_server + hermex connected |
+| Engine | Strata UD-IQ4_XS on **4 GPUs**, 11,211-11,329 expert slots, chunk 6,912, `--kv k8v4` |
+| Conversation cache | `--conversation-cache-slots 512`, `--conversation-cache-mib 262144`, **evictions 0** |
+| Memory | the engine's cgroup high 88 GiB (its floor is ~70), swap 271 GiB of NVMe |
+| Throughput (quiet box) | a 32,832-token cold read **548 / 499 tok/s**, an 84,082-token read **536 tok/s**, decode **36.6 tok/s** |
+| The bot chat's wait after a tool call | p50 **148-254 s** per turn; the engine had **5-111 requests queued** for its 2 slots |
+| Health | `logs/health_check.sh` 22 pass / 0 fail - `logs/hermes_health_check.sh` 21 pass / 0 fail |
+| Cron lanes | **19 jobs** (was 40), **one agent a day** |
+
+## What changed since 2026-11-21 (the 27 November session)
+
+### The wait after a tool call, and the four fixes
+
+The bot chat's cycle is **LLM turn (p50 208 s) -> tool (p50 60 s) -> LLM turn**. The analysis and
+the fixes are in `AGENTS.md` (the sections of 2026-11-27 09:20 -> 11:05). In short:
+
+1. **The stale watchdog was never where it was configured to be.** `providers.strata...stale_timeout_seconds`
+   never applied: the runtime provider id is `custom`, not `strata`, so the local branch took over
+   with its **900 s** default - and **120 "Stream stale for 900s" kills in 3 days** (30 h thrown
+   away) on 144k-336k-token contexts. **The knob that works is `agent.local_stream_stale_timeout`
+   (now 2700 s, in every config)**, plus `HERMES_API_TIMEOUT=3600` in `~/.hermes/.env` and every
+   profile's `.env` (the socket read timeout must not fire before the watchdog).
+2. **The engine's prompt-progress chunks.** `prompt_progress()` returned `None` under `--batch`, so
+   a client asking for `return_progress` got silence and the stall timer killed healthy prefills.
+   It now answers under `--batch` too, carries **the queue**, and `/props` advertises
+   `prompt_progress: true`. Hermes asks for it (a cached `/props` probe) and shows
+   *"processing prompt - 42 % - 6 requests ahead"*.
+3. **The prefetch.** The serve layer sends the waiting request's first 4 096 tokens as a `PRE`
+   control line; the engine touches the pages of the matching parked entry, so the NVMe page-in
+   (26-31 s when the snapshot was swapped out) overlaps the wait for a slot.
+4. **The queue is visible.** The clamp proxy's `GET /queue` now carries the engine's state
+   (the queue depth, the slots, the read progress, the shape): `tools/clamp/strata_clamp_proxy.py`.
+
+### The crons: 40 -> 19, twelve agent workers -> one
+
+The 40 schedules on a 2-slot engine were a permanent queue of workers. Deleted 22 (the dead
+Windows/WSL paths, the passed one-shots, the obsolete, the two-month-stale, the cloud-era, the
+seven phone spammers), folded three Hindsight consolidation jobs into one, and created **one**
+agent lane (`nightly maintenance sweep`, 03:30) that does the stability watch, the backup
+freshness and the Hindsight check **in order inside one turn**. Every delivery is now `local`.
+
+### The 6-GPU plan
+
+In `AGENTS.md` (the section of 2026-11-27 11:10): what a new board + 2 more RTX 3060s buy, what
+the motherboard must give (the CPU's PCIe lanes, XMP, ASPM, the fixed Gen 4 link), what to change
+in the profile, and how to measure it against the yardstick above.
+
 
 ## The five things that were wrong, and the fix
 
