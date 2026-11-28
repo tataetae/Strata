@@ -158,7 +158,10 @@ def handle(args: Any, session_id: str = "", **_: Any) -> str:
         lines.append("This chat is not waiting on the engine.")
 
     if mean_service:
-        ahead = (position - 1) if position else depth
+        # The requests ahead of this chat: the ones queued before it PLUS the slots that are
+        # busy now (they have to finish first).  Without a known place in the queue, the whole
+        # depth is ahead.
+        ahead = (position - 1 + len(busy)) if position else depth
         estimate = (ahead / max(1, total_slots)) * mean_service
         lines.append(f"A request takes about {_human_seconds(mean_service)} on average, so this chat waits "
                      f"roughly {_human_seconds(estimate)}.")
