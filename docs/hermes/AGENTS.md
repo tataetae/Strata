@@ -3640,6 +3640,59 @@ turn after it is now a ~1-3 k token read.
 segments are 2 MiB-aligned mmaps with MADV_HUGEPAGE, the prefetch pulls the pages back while the
 request waits, the parking has its own swap file at priority 100 and 8 GiB more of RAM.**
 
+## 2026-11-28 10:05 → 10:25 — the per-profile warm prefix (the "cached new session")
+
+Owner: *"can we have 'cached' new session of each profile? for system prompts and soul.md"* ·
+*"checkpoint settings too"*
+
+### What was already true, and what was missing
+
+**Hermes already keeps a session's prefix warm**: a continuing session replays its stored system
+prompt verbatim (`agent/prompt_refresh.py`: *"A continuing session replays its stored system
+prompt verbatim so the provider prefix cache stays warm"*), and the engine's conversation cache is
+keyed by the **token prefix** - so every session of a profile that sends the same head shares
+one cache entry. The head IS the system prompt + SOUL.md + the profile's markdown + the tool
+schemas: **65 861 bytes for system-maintainer, 74 440 for opencode-worker, 68 313 for root**
+(measured: the request bodies the clamp proxy sees).
+
+**What was missing: the engine's cache lives in the engine's RAM**, so every engine restart
+empties it and the next session of every profile pays a cold read of the whole head again.
+
+### The warm-up
+
+**`~/.hermes/scripts/warm_profiles.py`** rebuilds it. The clamp proxy already parses every request
+Hermes sends, so it now **captures each profile's request head**: the whole body with the
+conversation reduced to the system message plus a one-word placeholder, `max_tokens: 1`
+(`strata_clamp_proxy.py::capture_prefix`, written to
+`~/.hermes/state/prefix_captures/<profile>.json`, 0600).
+
+The replay carries the **exact request shape** - the same system message, the same tools, the
+same `reasoning_effort` - because the engine's chat template renders the head differently for each
+(the reasoning effort changes the system text; the tools are rendered into it). **The checkpoint
+settings come with it**: the parked entry is built with the engine's own checkpoint geometry, so
+its chain is the one the real turns would have and the restore is compatible.
+
+**Measured (the engine's own log):**
+
+```
+total  16152 | reused      0 | the read  16152 |  25.6 s   <- the warm-up: the head is read
+conversation cache: parked 16152 tokens ... snapshot_bytes=558321248
+total  16152 | reused   5632 | the read      0 |  48.2 s   <- the next turn of that profile: warm
+```
+
+**The timer**: `strata-warm-profiles.timer` (installed, enabled) runs it every 6 hours at a quiet
+hour (04:10 / 10:10 / 16:10 / 22:10) - the agent's cron windows are over by then, and it is NOT
+at boot (a boot storm of 20 prefills would starve the engine).
+
+**The engine's cache right now: 19 parked, 23.4 GiB, 0 evictions, 45 of 69 requests reused (65 %).**
+
+### The honest limit
+
+The warm-up rebuilds the cache **in RAM**: a restart still empties it, and the warm-up then has to
+rebuild it (one prefill per profile, 20-60 s each). **Persisting the cache across restarts would
+need a new engine control line** (the disk-session SAVE/RESTORE holds ONE conversation, the main
+session - not the cache's entries). That is the next piece, and it is engine work.
+
 ## Rules
 - Old disks stay read-only. Never expose 8647/9119 beyond the LAN without auth.
 - Don't send external messages on the owner's behalf. Don't delete the only copy of anything.
