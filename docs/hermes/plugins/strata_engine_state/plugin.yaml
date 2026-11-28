@@ -1,0 +1,13 @@
+name: strata_engine_state
+manifest_version: 1
+version: 1.0.0
+description: >
+  Read the local inference engine's live state: the queue depth, the slots, the prompt being
+  read, the conversation cache's reuse and an estimate of the wait. Lets an agent say why a
+  reply is slow instead of guessing from a silent wait. Read-only.
+author: Clara
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - strata_engine_state
