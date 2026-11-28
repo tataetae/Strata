@@ -13884,11 +13884,16 @@ int main(int argc, char** argv) {
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
             if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
-                // its park would drop (as superseded) the main session's copy of this conversation, and with it the checkpoints the slot
-                // does not hold - an agent's system-prompt root that the next requests borrow (#4420, as 0.2.6 did: the slot is overwritten)
-                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a parked copy of its "
-                                     "conversation holds checkpoints the slot does not; it stays)\n", b);
-                return;
+                  // The main session's parked copy of this conversation holds checkpoints the slot does not (an agent's
+                  // system-prompt root that the next requests borrow, #4420).  Parking used to be REFUSED here, because the
+                  // park would drop (as superseded) that copy and with it the root: the conversation's newer state was lost
+                  // and the next turn re-read the whole prompt (measured on four 200K chats over two slots: 255 of a
+                  // 256-token reply re-read; and with the slot handing over mid-read, the whole prefill again).
+                  // The cache now keeps BOTH copies (the conversation only appends, so the newer ids cover the older
+                  // prefix): the newer one is found for the next turn - the continuation works - and the older one keeps
+                  // the root for the siblings.  Logged, not refused.
+                  std::fprintf(stderr, "strata serve: conversation cache: slot %d parked beside the older copy of its "
+                                       "conversation (the older keeps the checkpoints the slot does not hold)\n", b);
             }
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "

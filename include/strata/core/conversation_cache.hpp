@@ -522,6 +522,52 @@ public:
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    /// Drop the parked entries an outgoing conversation supersedes, but KEEP the ones that hold a
+    /// checkpoint the outgoing chain does not have.
+    ///
+    /// drop_superseded() drops the same conversation's copy from a turn back (its deepest
+    /// checkpoint the outgoing chain holds).  A batch slot's chain holds ONE checkpoint while the
+    /// main session's parked copy holds the whole chain (the root at the end of an agent's system
+    /// prompt, #4420), so dropping that copy loses the root and every sibling re-reads the shared
+    /// prefix.  The caller therefore refused to park at all ("not parked before its overwrite") and
+    /// the conversation's NEWER state was LOST: the next turn found no parked copy of its own
+    /// prefix and re-read the whole prompt (measured on four 200K chats over two slots: 255 of a
+    /// 256-token reply re-read; and with the slot handing over mid-read, the whole prefill again).
+    ///
+    /// The conversation only appends, so the newer copy's ids cover the older one's prefix and its
+    /// K/V is a superset: BOTH can stay parked.  best() then finds the LONGER one for the next
+    /// turn - the continuation works - and the older one keeps the root for the siblings.  The
+    /// older copy ages out on its own (the budget's oldest-first eviction).
+    size_t drop_superseded_keeping_richer(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+        auto held = [&](const ConversationCheckpoint& c) {
+            if (c.ids == ids && c.imgs == images) return true;
+            for (const auto& k : checkpoints)
+                if (k.ids == c.ids && k.imgs == c.imgs) return true;
+            return false;
+        };
+        size_t dropped = 0;
+        for (size_t i = 0; i < entries_.size();) {
+            const auto& e = entries_[i];
+            const ConversationCheckpoint* deepest = nullptr;
+            for (const auto& c : e.checkpoints)
+                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
+                !(guarded_ != 0 && serials_[i] == guarded_)) {
+                bool richer = false;
+                for (const auto& c : e.checkpoints) if (!held(c)) { richer = true; break; }
+                if (richer) { ++i; continue; }   // keep it: it holds a checkpoint the new chain lacks
+                bytes_ -= e.bytes();
+                erase(i);
+                ++dropped;
+                continue;
+            }
+            ++i;
+        }
+        superseded_ += dropped;
+        return dropped;
+    }
+
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
         auto held = [&](const ConversationCheckpoint& c) {
@@ -600,7 +646,9 @@ public:
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+        // keep the richer entries: the conversation only appends, so the older copy and the
+        // newer one can both stay parked (the older keeps the root checkpoint the slot's chain lacks)
+        drop_superseded_keeping_richer(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);
