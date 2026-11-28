@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 namespace strata::core {
 
 // Snapshot-owned host storage. Appending never relocates existing payloads;
@@ -81,6 +85,17 @@ public:
                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
                 Segment segment;
                 segment.reserve(segment_capacity(count, previous, growing, held));
+                // The parked snapshots are the engine's largest pageable memory (4.9 GiB for a
+                // 308k-token conversation), and they are what a restore has to page back in.
+                // With 4 KiB pages the swap-in is a stream of tiny scattered reads: measured
+                // 240-440 MB/s against the device's 1.1 GB/s sequential, so a 213k-token
+                // conversation took 26-31 s to restore.  Asking for TRANSPARENT huge pages makes the
+                // kernel back each 16 MiB segment with 2 MiB pages, so the swap-out and the swap-in
+                // move 2 MiB units instead of 4 KiB ones.
+#if defined(__linux__)
+                if (segment.capacity() >= 2ull * 1024 * 1024 && segment.data())
+                    (void) madvise(segment.data(), segment.capacity(), MADV_HUGEPAGE);
+#endif
                 if (value) segment.resize(count, *value);
                 else segment.resize(count);
                 segments_.push_back(std::move(segment));
