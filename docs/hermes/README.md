@@ -3,18 +3,6 @@
 Everything needed to rebuild this box's Hermes setup after a reset.
 Written 2026-11-21, after the v0.23.3 merge and the GPU3 hardware failure.
 
-## The branches on the fork (tataetae/Strata)
-
-| branch | what it is |
-|---|---|
-| `clara/engine-0.1.56` | **the live engine's source of record**: the 0.1.56 tree, self-consistent (its C++ prefetch AND its serve layer), the tree the binary is built from |
-| `clara/prefill-main` | the **live tree's serve layer** (the 0.1.52 checkout that runs on the box: the prompt-progress chunks, the queue view, the prefetch hint) |
-| `clara/hermes-state` | **this directory**: the state, the record, the tooling |
-
-**The box runs a mix**: the 0.1.56 C++ binary (`strata-src/engine/strata`) with the 0.1.52 tree's
-Python serve layer (`strata-src/serve/server.py`). Both halves carry the 27 November changes; a
-rebuild from `clara/engine-0.1.56` alone gives a consistent tree.
-
 ## What this directory holds
 
 | file | what it is |
@@ -70,6 +58,39 @@ Windows/WSL paths, the passed one-shots, the obsolete, the two-month-stale, the 
 seven phone spammers), folded three Hindsight consolidation jobs into one, and created **one**
 agent lane (`nightly maintenance sweep`, 03:30) that does the stability watch, the backup
 freshness and the Hindsight check **in order inside one turn**. Every delivery is now `local`.
+
+### The 28 November work: the continuation, the parking partition, the queue tags
+
+**The continuation.** The conversation cache used to REFUSE the park of a conversation's newer
+state ("slot 0 not parked before its overwrite (a parked copy of its conversation holds
+checkpoints the slot does not; it stays)"), so the newer state was lost and the next turn re-read
+the whole prompt - 250-580 s for a 250k+ conversation. The cache now keeps BOTH copies (the
+conversation only appends, so the newer ids cover the older prefix): `best()` finds the longer one
+for the next turn and the older one keeps the root checkpoint for the siblings.
+
+Measured: `prompt 45793 tokens = 45792 reused (100.0%) + 1 read in 0.0 s`,
+`173126 = 169380 reused (97.8%)`, `175618 = 174648 reused (99.4%)`.
+
+**The parking partition.** MADV_HUGEPAGE only works on a 2 MiB-ALIGNED range (on an unaligned one
+it fails with EINVAL: measured, malloc gave an unaligned address and the heap stayed 0.3 % huge;
+an aligned mmap gave 16 384 kB of huge pages). The cache's segments are now their own 2 MiB-
+aligned anonymous mappings, and the engine pins glibc's mmap threshold to 8 MiB. The restores:
+305 106 tokens in **543.7 ms**, 169 380 in **344.7 ms**, 174 648 in **318.0 ms** (it was 5-31 s,
+and up to 96 s).
+
+**The root script** (`tools/parking-partition.sh`): a dedicated swap file for the parking at
+priority 100 (the engine's snapshot pages land there contiguously) and the engine's cgroup
+MemoryHigh 88 -> 96 GiB (the hot snapshots stay in RAM). APPLIED on 2026-11-28: the engine's
+cgroup is at 86.6 of 96 GiB, the host has 7-10 GiB available, the swap is 335 GiB with 332 free.
+
+**The queue.** `GET /queue` on the clamp proxy now carries each chat's own phase as a tag
+("compressing context", "running a tool", "waiting for the model") and the cache's counters, so
+the dashboard's "Chats in flight" shows a CACHE row: `the reuse: 7/28 requests - 92% of the
+prompt tokens`.
+
+**What the give-way costs now:** 2 in a whole session, both at the first chunk (5 888 tokens),
+48 s in total - the partial survives and the retry resumes from it (`reused 5888`). The big win
+was the cache keeping both copies, not the give-way.
 
 ### The 6-GPU plan
 
