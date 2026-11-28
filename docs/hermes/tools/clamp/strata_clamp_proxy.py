@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -79,6 +81,74 @@ def clamp_body(raw: bytes) -> tuple[bytes, int | None, int | None]:
     return json.dumps(body).encode(), before, after
 
 
+
+# The per-profile PREFIX capture: the system message and the tools of the last request each
+# profile sent.  That prefix is the conversation's shared head - the engine's conversation cache is
+# keyed by the token prefix, so a prefix that has been read once is reused by every later session of
+# that profile.  It is what a warm-up needs to rebuild the cache after an engine restart.
+PREFIX: dict = {}
+PREFIX_MAX = 64 * 1024 * 1024     # the bytes kept per profile
+CAPTURE_DIR = "/home/clara/.hermes/state/prefix_captures"
+_PREFIX_LOCK = threading.Lock()
+
+
+def capture_prefix(raw: bytes, profile: str) -> None:
+    """Keep a REPLAYABLE copy of this profile's request head; never raises.
+
+    The whole request body is kept, with the conversation reduced to the system message plus a
+    one-word placeholder user message, and max_tokens set to 1.  Replaying that body reproduces the
+    engine's chat template EXACTLY - the same system message, the same tools, the same reasoning
+    effort - so the token prefix is the conversation's real shared head.  The engine's conversation
+    cache is keyed by that prefix: once it has been read, every later session of the profile reuses
+    it (a warm start), and a warm-up after an engine restart rebuilds it.
+    """
+    if not profile:
+        return
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            return
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return
+        system = None
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "system":
+                system = m
+                break
+        if system is None:
+            return
+        head = dict(body)
+        head["messages"] = [system, {"role": "user", "content": "warm"}]
+        head["max_tokens"] = 1
+        head["temperature"] = 0
+        head.pop("stream", None)
+        blob = json.dumps(head, sort_keys=True)
+        if len(blob) > PREFIX_MAX:
+            return
+        with _PREFIX_LOCK:
+            PREFIX[profile] = blob
+        # and on disk, so the warm-up (a separate process) can read it
+        try:
+            d = CAPTURE_DIR
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, re.sub(r"[^A-Za-z0-9_.-]", "_", profile) + ".json")
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(blob)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def prefix_captures() -> dict:
+    """The captured prefixes, per profile."""
+    with _PREFIX_LOCK:
+        return dict(PREFIX)
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "StrataClamp/1.0"
@@ -103,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         live = d.get("live") or {}
         engine = d.get("engine") or {}
+        cache = d.get("conversation_cache") or {}
         return {
             "state": live.get("state"),
             "running": live.get("running"),
@@ -116,14 +187,59 @@ class Handler(BaseHTTPRequestHandler):
             "slots": [{"slot": s.get("slot"), "state": s.get("state"),
                        "read": s.get("prompt_read"), "total": s.get("prompt_tokens"),
                        "elapsed_s": s.get("elapsed_s")} for s in (live.get("slots") or [])],
+            # the cache: what it gave back, so a cold read is visible as such
+            "cache": {
+                "enabled": cache.get("enabled"),
+                "budget_mib": cache.get("budget_mib"),
+                "slots": cache.get("slots"),
+                "parked": cache.get("parked"),
+                "bytes": cache.get("bytes"),
+                "evictions": cache.get("evictions"),
+                "requests": cache.get("requests"),
+                "requests_reused": cache.get("requests_reused"),
+                "reused_tokens": cache.get("reused_tokens"),
+                "prompt_tokens": cache.get("prompt_tokens"),
+            },
         }
+
+    @staticmethod
+    def _tag(phase: str, in_flight: bool) -> str:
+        """The chat's phase, as a short tag for the queue.
+
+        The engine knows whether a request is reading or decoding; Hermes knows what the agent is
+        doing with it (compressing the context, running a tool, waiting for the first token). The
+        queue shows both, because they answer different questions: the engine's view says how long
+        the model will take, Hermes's says why the chat is waiting at all.
+        """
+        p = (phase or "").strip()
+        low = p.lower()
+        if "compress" in low:
+            return "compressing context"
+        if "tool" in low or "command running" in low:
+            return "running a tool"
+        if "model reading the prompt" in low:
+            return "reading the prompt"
+        if "receiving stream response" in low:
+            return "generating"
+        if "waiting for stream response" in low or "waiting for provider" in low:
+            return "waiting for the model"
+        if "starting" in low:
+            return "starting"
+        if "compaction" in low or "summary" in low:
+            return "compressing context"
+        return "waiting for the model" if in_flight else "queued"
 
     def _queue_view(self) -> None:
         """GET /queue - who is waiting and who is generating, by chat title."""
         view = REGISTRY.view() if REGISTRY else {"reading": [], "generating": []}
         view.setdefault("status", "healthy" if REGISTRY else "unavailable")
         view["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for item in view.get("reading") or []:
+            item["tag"] = self._tag(item.get("phase") or "", True)
+        for item in view.get("generating") or []:
+            item["tag"] = self._tag(item.get("phase") or "", False)
         view["engine"] = self._engine_state()
+        view["prefixes"] = {p: len(b) for p, b in prefix_captures().items()}
         body = json.dumps(view, default=str).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -179,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.flush()
             if REGISTRY is not None:
                 session, prompt_tokens, model = self._identify(raw)
+                capture_prefix(raw, (session or {}).get("profile") or "")
                 reg_key = REGISTRY.begin(session, prompt_tokens, model)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP}
         req = urllib.request.Request(UPSTREAM + self.path, data=raw or None,

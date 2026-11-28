@@ -1,0 +1,18 @@
+[Unit]
+Description=Warm the Strata engine's conversation cache with each Hermes profile's shared prefix
+After=network-online.target strata-iq3s-server.service
+Wants=strata-iq3s-server.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/clara
+ExecStart=/usr/bin/python3 /home/clara/.hermes/scripts/warm_profiles.py
+# A warm-up is a prefill of each profile's head: it competes with the owner's own turns, so it
+# runs at a quiet hour and never at boot (the boot storm would starve the engine).
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+
+[Install]
+WantedBy=multi-user.target
