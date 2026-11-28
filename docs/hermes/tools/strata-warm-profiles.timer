@@ -1,0 +1,16 @@
+[Unit]
+Description=Warm the Strata engine's conversation cache (the profiles' shared prefix)
+
+[Timer]
+# Every 6 hours at a quiet hour (04:10, 10:10, 16:10, 22:10 - the agent's cron windows are over
+# by then), and once after a restart of the engine (the cache lives in the engine's RAM).
+OnCalendar=*-*-* 04:10:00
+OnCalendar=*-*-* 10:10:00
+OnCalendar=*-*-* 16:10:00
+OnCalendar=*-*-* 22:10:00
+OnUnitActiveSec=6h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
