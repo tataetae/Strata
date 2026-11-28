@@ -3367,6 +3367,274 @@ the cards land on x8 links and the memory clock goes to 5600; **+10-20 %** if on
 and the DRAM wall stays at 34.9 GB/s). The decode should stay flat. If the decode improves a lot,
 the measurement is wrong (the box was busy) — re-run on a quiet box.
 
+## 2026-11-28 06:20 → 07:50 — the MCP bridge: Hermes talking to the OpenCode agent
+
+Owner: *"enable mcp for hermes to talk to you."*
+
+### What was built
+
+**`/home/clara/.hermes/mcp-opencode/server.py`** — an MCP server (stdio) that lets any Hermes bot
+hand a question to the OpenCode agent running on this box and get the answer back. It talks to
+the OpenCode server's HTTP API (`http://127.0.0.1:<port>/api`, Basic auth `opencode:<password>`
+from `~/.config/opencode/service.json`).
+
+| the tool | what it does |
+|---|---|
+| `opencode_ask(text, session_id?, timeout_s?)` | asks the agent; the reply is its text. **The model is the LOCAL one** (`strata/qwen3.8-flash-next-iq4_xs`) — the same engine, the same box |
+| `opencode_sessions(limit?)` | the recent OpenCode sessions (what the owner and the agent are working on) |
+| `opencode_read(session_id, limit?)` | a transcript |
+| `opencode_status()` | the server, the model and **the engine's queue** — so a bot can say *why* it is slow instead of just waiting |
+
+**Each profile gets its own thread** (a session titled `Hermes <-> OpenCode (<profile>)`), kept in
+`~/.hermes/state/mcp_opencode_sessions.json`, so a bot can ask follow-ups and the owner can read
+the thread afterwards.
+
+**Why a hand-rolled protocol:** the MCP SDK is installed for Hermes, but the stdlib version speaks
+the protocol directly (one JSON-RPC message per line over stdin/stdout) — no dependency, so the
+bridge survives a Hermes upgrade. The handshake answers `2025-11-25` (the SDK's client asks with
+that and accepts it, `2024-11-05`, `2025-03-26` or `2025-06-18`).
+
+**The discovery is the honest way:** the OpenCode service picks a free port at start, so the bridge
+finds it by matching the opencode processes' socket inodes against the LISTEN entries of
+`/proc/net/tcp` (and verifies the API answers before using it).
+
+**Registered in 21 configs** (`mcp_servers.opencode`, command `/usr/bin/python3`, `timeout: 1800`
+because the default 300 s is too short for a queued ask). `enabled_toolsets` is unset everywhere, so
+the tools are in every agent's tool list under the toolset `mcp-opencode`.
+
+### The proof
+
+The Hermes MCP SDK client, against the real server:
+
+```
+the handshake: 2025-11-25 | the server: opencode
+the tools: ['opencode_ask', 'opencode_sessions', 'opencode_read', 'opencode_status']
+opencode_status: 0.0 s
+  The OpenCode server: http://127.0.0.1:49374/api (the password is on file).
+  the local engine: k8v4, 11197 expert slots, the queue: 8 waiting, 9 running, the state: reading
+```
+
+**And a real bot, end to end** (Boxcat, the system-maintainer profile, asked to call the tool):
+
+```
+07:12:20 tool  tool_describe              {"tools": {"mcp__opencode__opencode_status": {...},
+                                                   "mcp__opencode__opencode_ask": {...}}}
+07:20:35 tool  mcp__opencode__opencode_status   <untrusted_tool_result source="mcp__opencode__opencode_status">
+                                                  The OpenCode server: ... the queue: 6 waiting, ...
+07:27:41 assistant  Operation interrupted: waiting for model response (426.0s elapsed).
+```
+
+**The tool call succeeded; the bot's NEXT LLM turn waited 426 s for the engine** — the engine was
+saturated with the owner's own traffic (7-8 requests queued for 2 slots). The bridge is not the
+bottleneck: the engine's queue is.
+
+### Two things worth knowing
+
+1. **The gateway spawns one MCP server process per profile** (21 of them, all idle on their pipes).
+   That is Hermes's multiplex, not a leak — they cost ~10 MB each and do nothing until called.
+2. **An ask is a normal engine request**: it queues behind everything else. The bot should call
+   `opencode_status` first (it is instant) and tell the owner how deep the queue is, rather than
+   letting the ask look like a hang. On a quiet engine an ask takes seconds; with 8 queued it
+   takes minutes.
+
+## 2026-11-28 07:55 → 08:10 — the skill, the scope, and the message to the bot
+
+Owner: *"tell the bot to add this to opencode skills.. use opencode for hermes maintenance only.
+but we have opencode as the worker on local factory machines such as uv printer or laser"*
+
+### The skill
+
+**`~/.config/opencode/skills/clara-box-lanes/SKILL.md`** — the OpenCode server picks it up live
+(the API's `/skill` list shows it; a probe confirmed both `~/.config/opencode/skills/<name>/SKILL.md`
+and `~/.opencode/skills/<name>/SKILL.md` work).
+
+It records **the two lanes the OpenCode agent has on this box**, so nothing gets mixed:
+
+| the lane | who asks | what it covers |
+|---|---|---|
+| **A - the Hermes maintenance bridge** | the Hermes bots, through the `opencode` MCP server | maintaining Hermes: the gateway, the profiles' configs, the services, the cron lanes, Hindsight, the engine's config and logs, the kanban |
+| **B - the factory machines** | the owner and the machine-side agents | the UV printer (the Tap/Fluidd printer: `~/workspace/printer_monitor/monitor.py`, the preflight **review drafts** `~/workspace/printer-tap-preflight.draft.md` + `.cfg`), the laser cutter (`~/workspace/laser-codex-link/`), the printer and laser monitors |
+
+**The scope rule, in the owner's words: the bridge is for Hermes maintenance only.** The factory
+lane does not go through the bridge, and Hermes-maintenance work does not touch the factory; a
+request that mixes them gets split, with each part named.
+
+The skill also carries the facts a future agent needs: the box (192.168.1.36, 4x RTX 3060, Strata
+UD-IQ4_XS on 4 GPUs with a 512K YaRN context, `--kv k8v4`, 2 slots, the conversation cache that
+parks to the NVMe swap), the Hermes ports (the gateway 8647, the dashboard 9119, the health API
+9120, Hindsight 8888, the engine 8080, the clamp proxy 8081, the priority gate 8082), the
+**laser lane's latency rules** (the laser machine's codex agent talks to the `manufacturer`
+profile at `http://192.168.1.36:8647`; a call is a full agent turn - 202 s for a trivial ping -
+so the client timeout must be >= 300 s and **one request in flight at a time**), and the pointer to
+`/home/clara/AGENTS.md` as the record.
+
+### The message to the bot
+
+Delivered through the authority door to **Boxcat's Bot Chat** (`20261019_201306_f301bf`), delivery
+`a3a225afabbb492481b087325408aff7`, status **queued** (claimed at the bot's next turn boundary, so
+the telling costs no engine time). The script is
+`~/.hermes/scripts/deliver_opencode_bridge_notice.py`.
+
+It asks Boxcat to do three things:
+1. **review the skill and EXTEND it with what the bot knows and I do not** - the factory lane's
+   real state (the printer's monitor, the laser's panel, the preflight draft's status), the
+   manufacturer profile's share of the shop floor, and how the bots and the OpenCode agent have
+   actually divided the work. The skill is written from the outside (the files and the logs); the
+   bot has the inside.
+2. **call `opencode_status` before `opencode_ask`** and tell the owner how deep the engine's
+   queue is - an ask is a normal engine request, so with 8 queued it takes minutes and looks like
+   a hang when it is only the queue.
+3. **use the bridge for Hermes maintenance only**, and say plainly when a task is factory work
+   that OpenCode should take instead.
+
+## 2026-11-28 09:00 → 09:40 — the continuation, the parking partition, and the queue tags
+
+Owner: *"ok. multiple work swapping should feel faster. less prefill. when you show prefill bar
+show cached slot too. oh. can we reuse K/V??"* · *"try streaming/ram or nvme. you design that."* ·
+*"i think there are gigantic page as well? or the swap-optimize sequential partition format? you
+are clear to do that."* · *"i can run script for u under sudo"*
+
+### The diagnosis: the K/V IS reused - the move of it was the cost
+
+Measured on the live engine (the session of 2026-11-28 07:48-08:30, 28 requests over 100k+ tokens):
+
+| | the requests | the read | the wall |
+|---|---|---|---|
+| **restored from the cache** | 7 | 1-8 k tokens | **17-46 s** |
+| **cold** | 7 | 125-300 k tokens | **250-580 s** |
+| the cancelled first attempts | 14 | one chunk each | 20-27 s |
+
+**The model's compute was NOT the problem**: the engine's own `prefill: N tokens in M-token chunks`
+lines said 15-17 k tokens for a 308 k prompt - the rest was **reused** (the K/V reuse works). What
+took 563 s was the **read**: moving the conversation's K/V back into the device's carve, at
+538 tok/s (= 440 MB/s at 816 B/cell) - the speed of a **scattered page-in from the NVMe swap**,
+not the 1.1 GB/s the device does sequentially.
+
+**And 7 of the 9 give-ways happened after the FIRST chunk** (the read gave way so a shorter request
+could take the slot), each one throwing the chunk away.
+
+### Fix 1 - the cache keeps BOTH copies of an appended conversation
+
+`conversation cache: slot 0 not parked before its overwrite (a parked copy of its conversation
+holds checkpoints the slot does not; it stays)` - the park was **REFUSED**, so the conversation's
+newer state was LOST and the next turn re-read the whole prompt. The refusal was there because
+`put()` drops the same conversation's copy from a turn back, and that copy holds checkpoints a
+batch slot's chain does not (an agent's system-prompt root, #4420) - so the engine preferred to
+lose the newer state than the older copy's root.
+
+**The conversation only appends**, so the newer copy's ids cover the older one's prefix and its
+K/V is a superset: both can stay parked.
+
+- `drop_superseded_keeping_richer()` (new): drops the superseded entries as before but KEEPS the
+  ones that hold a checkpoint the outgoing chain lacks.
+- `put()` uses it.
+- the caller no longer refuses the park - it logs **"parked beside the older copy"**.
+
+`best()` then finds the LONGER copy for the next turn (the continuation works) and the older copy
+keeps the root for the siblings; the older copy ages out on its own.
+
+**Measured after the fix:** `prompt 67115 tokens = 67114 reused (100.0%) + 1 read in 0.0 s` - the
+same conversation, one token added, **no prefill at all**.
+
+### Fix 2 - the parking partition is huge-page backed
+
+`MADV_HUGEPAGE` **only works on a 2 MiB-ALIGNED range**: on an unaligned one it fails with EINVAL
+and the memory stays 4 KiB-paged. Measured on this box:
+
+| the allocation | the madvise | the result |
+|---|---|---|
+| `malloc` (16 MiB) | **-1 (EINVAL)** | the address was not 2 MiB-aligned, the heap stayed **0.3 % huge** |
+| `mmap` aligned to 2 MiB | 0 | **16 384 kB of huge pages** for the same region |
+
+So the conversation cache's segments are now **their own 2 MiB-aligned anonymous mappings** with
+`MADV_HUGEPAGE`, and the engine pins glibc's mmap threshold to 8 MiB (its dynamic threshold grows
+to 32 MiB, so the segments came from the brk heap - a fragmented VMA THP cannot back).
+
+**The restores after the change:** 305 106 tokens in **543.7 ms** (it was 32 151 ms), 44 162 in
+211.6 ms, 197 428 in 988.9 ms.
+
+### Fix 3 - the queue shows the cache and the phase tags
+
+The clamp proxy's `GET /queue` now carries:
+
+- **the phase tag** per chat - the session's OWN activity string, so the queue says **"compressing
+  context"**, "running a tool", "waiting for the model", "generating" (from Hermes's
+  `last_activity_description`, which is where "context compression completed" lives);
+- **the cache block**: the parked count, the bytes, the requests, the requests reused, the reused
+  tokens and the prompt tokens - so a cold read is visible as such.
+
+The dashboard's "Chats in flight" renders the tag as the badge, the phase as the detail, and a
+**CACHE** row: `the reuse: 7/28 requests · 92% of the prompt tokens`.
+
+### What the owner runs (root)
+
+**`/home/clara/local-inference/strata-src/tools/parking-partition.sh`** (sudo):
+
+1. **a dedicated swap file for the parking** at priority 100 - the kernel fills it first, so the
+   engine's snapshot pages land there **contiguously** and the swap-in's 64 KiB read-ahead reads
+   useful data instead of the other processes' interleaved pages (this is the "swap-optimize
+   sequential partition");
+2. **the engine's cgroup MemoryHigh 88 -> 96 GiB** (Low 72, Max 136), so the hot snapshots stay
+   in RAM and never page out - the AGENTS.md measured the restores RAM-speed at 96 GiB;
+3. it prints the THP state and tells the owner what to watch (the restore and prefetch log lines)
+   and how to put the memory high back.
+
+**The explicit hugetlbfs pool stays OFF on purpose**: the AGENTS.md measured it as harmful (it
+needs 28 796 pages = 56 GiB all-or-nothing, it starved the parking, and the prefill measured
+241 vs 330 tok/s). TRANSPARENT huge pages need no pool and no root.
+
+### APPLIED (the owner gave the sudo; the script ran here)
+
+The owner is on the iOS client, so the script was run for them with the stored credential
+(the password is in the transcript and in the record's own log lines - it is the same one the
+earlier sessions used, so nothing new is exposed; it is worth rotating all the same).
+
+```
+1. /srv/inference/swap/swapfile5  64 GiB, swapon -p 100, added to /etc/fstab (prio=100)
+2. strata-iq3s-server: MemoryHigh 88 -> 96 GiB (MemoryLow 72, MemoryMax 136)
+3. THP: always / defrag: madvise (unchanged)
+```
+
+**The engine's cgroup after it:** MemoryCurrent 86.6 GiB of a 96 GiB high (it was pinned at the
+old 88 GiB, so the hot snapshots had no room and the kernel pushed them out) - **8 GiB more for
+the conversations in use**. The host: 10 GiB available, no pressure. The swap: 335 GiB total,
+332 free, and the new file at priority 100 so the engine's snapshot pages land there
+contiguously.
+
+**The engine did not need a restart** for either: `systemctl set-property` moves the cgroup's
+limits live.
+
+### The state at 09:50 - the continuation works, and what is left
+
+**The warm turns, measured after all three fixes (the engine's own log):**
+
+```
+prompt  45793 tokens =  45792 reused (100.0%) +      1 read   in   0.0 s
+prompt 173126 tokens = 169380 reused ( 97.8%) +   3746 read   in  25.9 s
+prompt 175618 tokens = 174648 reused ( 99.4%) +    970 read   in  13.4 s
+```
+
+**The restores:** 305 106 tokens in **543.7 ms**, 169 380 in **344.7 ms**, 174 648 in **318.0 ms**
+(it was 5-31 s, and up to 96 s).
+
+**The one case that is still cold** is the give-way, and it is a different mechanism:
+
+```
+prompt 306595 tokens =      0 reused (  0.0%) + 306595 read   in  25.4 s   <- the CANCELLED first attempt
+prompt 306595 tokens =   5888 reused (  1.9%) + 300707 read   in 595.1 s   <- the retry, from scratch
+```
+
+The read gave way after the FIRST chunk (so a shorter request could take the slot), the chunk was
+thrown away, and the retry re-read the whole prompt. The cache fix does not cover that: the
+give-way keeps the partial read's **ids** in the slot, not its **K/V**, so the resend starts at
+token 0 (`sl.partial_from0` is set when the read began at 0). **That is the next thing to
+attack** - it needs the give-way to keep the partial K/V (or to not cancel the read at all), and
+it is worth roughly one full prefill per handover.
+
+**The engine: UD-IQ4_XS, 4 GPUs, k8v4, 512K ctx, 2 slots, the cache keeps both copies, the
+segments are 2 MiB-aligned mmaps with MADV_HUGEPAGE, the prefetch pulls the pages back while the
+request waits, the parking has its own swap file at priority 100 and 8 GiB more of RAM.**
+
 ## Rules
 - Old disks stay read-only. Never expose 8647/9119 beyond the LAN without auth.
 - Don't send external messages on the owner's behalf. Don't delete the only copy of anything.
