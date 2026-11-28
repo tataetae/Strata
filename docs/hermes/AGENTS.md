@@ -3617,19 +3617,24 @@ prompt 175618 tokens = 174648 reused ( 99.4%) +    970 read   in  13.4 s
 **The restores:** 305 106 tokens in **543.7 ms**, 169 380 in **344.7 ms**, 174 648 in **318.0 ms**
 (it was 5-31 s, and up to 96 s).
 
-**The one case that is still cold** is the give-way, and it is a different mechanism:
+**What the give-way actually costs (measured after the fixes):** **2 in a whole session**, both
+at the first chunk (5 888 tokens), **48 s in total** - and the partial SURVIVES: the retry reads
+`reused 5888`, i.e. it resumes from the chunk the give-way kept. So the give-way was never the
+big cost; **the cache refusing the park was** (that lost the WHOLE conversation's state, not one
+chunk).
+
+**The cold reads that remain are first turns** - a conversation's state has to be computed once,
+and if that first read is cancelled the retry re-reads it (there is nothing older to reuse):
 
 ```
-prompt 306595 tokens =      0 reused (  0.0%) + 306595 read   in  25.4 s   <- the CANCELLED first attempt
-prompt 306595 tokens =   5888 reused (  1.9%) + 300707 read   in 595.1 s   <- the retry, from scratch
+prompt 202400 tokens =      0 reused ( 0.0%) + 202400 read  in  22.6 s   <- the cancelled first attempt
+prompt 202400 tokens =   5888 reused ( 2.9%) + 196512 read  in 406.4 s   <- the retry: the state never existed
+prompt 309786 tokens = 308626 reused (99.6%) +   1160 read  in  21.1 s   <- the next turn: warm
 ```
 
-The read gave way after the FIRST chunk (so a shorter request could take the slot), the chunk was
-thrown away, and the retry re-read the whole prompt. The cache fix does not cover that: the
-give-way keeps the partial read's **ids** in the slot, not its **K/V**, so the resend starts at
-token 0 (`sl.partial_from0` is set when the read began at 0). **That is the next thing to
-attack** - it needs the give-way to keep the partial K/V (or to not cancel the read at all), and
-it is worth roughly one full prefill per handover.
+The first turn is a cold read of the whole conversation at the hardware's ceiling (~500-600 tok/s
+on a quiet box, the AGENTS.md's measured maximum), so it cannot be made much cheaper - but every
+turn after it is now a ~1-3 k token read.
 
 **The engine: UD-IQ4_XS, 4 GPUs, k8v4, 512K ctx, 2 slots, the cache keeps both copies, the
 segments are 2 MiB-aligned mmaps with MADV_HUGEPAGE, the prefetch pulls the pages back while the
