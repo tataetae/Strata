@@ -1,0 +1,17 @@
+[Unit]
+Description=Strata overnight watch (the re-prefills, the evictions, the queue, the box)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/clara/.hermes/scripts
+Environment=HOME=/home/clara
+Environment=HERMES_HOME=/home/clara/.hermes
+Environment=STRATA_WATCH_INTERVAL_S=60
+ExecStart=/usr/bin/python3 /home/clara/.hermes/scripts/strata_overnight_watch.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -132,6 +132,7 @@ def _summary(metrics: Optional[dict]) -> dict:
             "requests": cache.get("requests"),
             "requests_reused": cache.get("requests_reused"),
         },
+        "cache_slots": cache.get("slots"),
         "slots": [{"slot": s.get("slot"), "state": s.get("state"),
                    "prompt_tokens": s.get("prompt_tokens"), "generated": s.get("generated"),
                    "elapsed_s": s.get("elapsed_s"), "tok_s": s.get("tok_s")} for s in slots],
@@ -181,6 +182,7 @@ PAGE = """<!doctype html>
 <input id="k" type="password" placeholder="the engine key">
 <button onclick="load()">refresh</button>
 <div id="out" class="cards"></div>
+<div id="cache"></div>
 <div id="rows"></div>
 <script>
 let key = localStorage.getItem('strataKey') || '';
@@ -193,12 +195,18 @@ async function load(){
     fetch('/state', {headers:h}).then(r=>r.json()),
     fetch('/queue', {headers:h}).then(r=>r.json())]);
   const s = state.error ? {error: state.error} : state;
+  const cache = s.cache || {};
   const cards = s.error ? '' : [
-    ['running', s.running], ['waiting', s.waiting_for_a_slot],
-    ['slots', s.busy_slots + '/' + s.total_slots], ['read tok/s', s.prefill_tok_s || '-'],
-    ['parked', (s.cache||{}).parked || 0], ['evictions', (s.cache||{}).evictions || 0]].map(c =>
+    ['in flight', s.running], ['waiting for a slot', s.waiting_for_a_slot],
+    ['batch slots', s.busy_slots + '/' + s.total_slots], ['read tok/s', s.prefill_tok_s || '-'],
+    ['parked chats', cache.parked || 0], ['evictions', cache.evictions || 0]].map(c =>
       '<div class="card"><b>'+c[1]+'</b><span>'+c[0]+'</span></div>').join('');
   document.getElementById('out').innerHTML = s.error ? '<div class="err">'+s.error+'</div>' : cards;
+  const cacheNote = s.error ? '' :
+    '<div class="sub">the conversation cache: '+ (cache.parked || 0) +' of ' + (s.cache_slots || '?') +
+    ' conversations parked' + (cache.bytes ? ' · ' + (cache.bytes/1073741824).toFixed(1) + ' GiB' : '') +
+    ' · the engine has ' + (s.total_slots||'?') + ' batch slots (concurrent requests)</div>';
+  document.getElementById('cache').innerHTML = cacheNote;
   const rows = (queue.reading||[]).concat(queue.generating||[]);
   document.getElementById('rows').innerHTML = rows.length ? '<table><tr><th>#</th><th>chat</th>'+
     '<th>phase</th><th>waiting</th><th>tokens</th></tr>' + rows.map(r =>

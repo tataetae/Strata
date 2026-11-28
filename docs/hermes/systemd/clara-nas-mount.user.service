@@ -1,0 +1,22 @@
+[Unit]
+Description=The private Nextcloud NAS (clara-serv-01) mounted on /home/clara/nas
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/clara
+Environment=PATH=/home/clara/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The NAS certificate names clara.local, which does not resolve on this box (the hosts
+# file is root-owned), so the name cannot be checked against the IP we dial.
+Environment=RCLONE_NO_CHECK_CERTIFICATE=true
+ExecStartPre=-/usr/bin/fusermount3 -u /home/clara/nas
+ExecStart=/home/clara/.local/bin/rclone mount nasc: /home/clara/nas \
+    --dir-cache-time 30s --poll-interval 15s --vfs-cache-mode writes \
+    --log-file /home/clara/logs/rclone-nas-mount.log --log-level INFO
+ExecStop=/usr/bin/fusermount3 -u /home/clara/nas
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
