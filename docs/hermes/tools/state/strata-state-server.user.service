@@ -1,0 +1,21 @@
+[Unit]
+Description=Strata engine state on the LAN (the queue, the slots, the cache)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/clara/.hermes/scripts
+Environment=HOME=/home/clara
+Environment=HERMES_HOME=/home/clara/.hermes
+Environment=STRATA_STATE_PORT=9000
+Environment=STRATA_STATE_HOST=0.0.0.0
+Environment=STRATA_STATE_LAN_PORT=9120
+Environment=STRATA_ENGINE_URL=http://127.0.0.1:8080
+Environment=STRATA_QUEUE_VIEW_URL=http://127.0.0.1:8081/queue
+ExecStart=/usr/bin/python3 /home/clara/.hermes/scripts/strata_state_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
