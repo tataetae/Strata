@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <initializer_list>
 #include <memory>
 #include <utility>
@@ -167,7 +168,98 @@ private:
         template<class U> void construct(U* p) { ::new ((void*) p) U; }
         template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
     };
-    using Segment = std::vector<uint8_t, DefaultInit<uint8_t>>;
+    // A segment is an mmap, not a malloc: the parked snapshots are what a restore has to page back
+    // in, and MADV_HUGEPAGE only works on a 2 MiB-ALIGNED range (on an unaligned one it fails with
+    // EINVAL and the memory stays 4 KiB-paged: measured 240-440 MB/s of scattered page-in against the
+    // device's 1.1 GB/s sequential, and a 213k-token conversation took 26-31 s to restore).  With a
+    // 2 MiB-aligned mmap the kernel backs each segment with 2 MiB pages, so the swap-out and the
+    // swap-in move 2 MiB units.
+// A segment is an mmap, not a malloc: the parked snapshots are what a restore has to page back
+// in, and MADV_HUGEPAGE only works on a 2 MiB-ALIGNED range (on an unaligned one it fails with
+// EINVAL and the memory stays 4 KiB-paged: measured 240-440 MB/s of scattered page-in against the
+// device's 1.1 GB/s sequential, and a 213k-token conversation took 26-31 s to restore).  With a
+// 2 MiB-aligned mmap the kernel backs each segment with 2 MiB pages, so the swap-out and the
+// swap-in move 2 MiB units.
+class Segment {
+public:
+    Segment() = default;
+    Segment(const Segment& o) { copy_from(o); }
+    Segment& operator=(const Segment& o) {
+        if (this != &o) { release(); copy_from(o); }
+        return *this;
+    }
+    Segment(Segment&& o) noexcept
+        : p_(o.p_), base_(o.base_), map_len_(o.map_len_), cap_(o.cap_), size_(o.size_) {
+        o.p_ = nullptr; o.base_ = 0; o.map_len_ = 0; o.cap_ = o.size_ = 0;
+    }
+    Segment& operator=(Segment&& o) noexcept {
+        if (this != &o) {
+            release();
+            p_ = o.p_; base_ = o.base_; map_len_ = o.map_len_; cap_ = o.cap_; size_ = o.size_;
+            o.p_ = nullptr; o.base_ = 0; o.map_len_ = 0; o.cap_ = o.size_ = 0;
+        }
+        return *this;
+    }
+    ~Segment() { release(); }
+    size_t size() const { return size_; }
+    size_t capacity() const { return cap_; }
+    uint8_t* data() { return p_; }
+    const uint8_t* data() const { return p_; }
+    bool empty() const { return size_ == 0; }
+    // Reserve the room for `n` bytes; the pages are untouched (the caller fills them).
+    void reserve(size_t n) {
+        if (n <= cap_) return;
+        release();
+        cap_ = n;
+        allocate(n);
+    }
+    void resize(size_t n, uint8_t value = 0) {
+        if (n > cap_) reserve(n);
+        if (n > size_ && p_) std::memset(p_ + size_, value, n - size_);
+        size_ = n;
+    }
+    void clear() { size_ = 0; }
+private:
+    void release() {
+        if (base_) {
+            munmap(reinterpret_cast<void*>(base_), map_len_);
+            base_ = 0; map_len_ = 0;
+        }
+        p_ = nullptr; cap_ = 0; size_ = 0;
+    }
+    void copy_from(const Segment& o) {
+        cap_ = o.cap_; size_ = o.size_;
+        allocate(o.cap_);
+        if (p_ && o.p_) std::memcpy(p_, o.p_, o.size_);
+    }
+    // The mapping is larger than the segment (it is 2 MiB-aligned), so the base and the whole
+    // length are kept: releasing it must hand back exactly what mmap took.
+    void allocate(size_t n) {
+        p_ = nullptr; base_ = 0; map_len_ = 0;
+        if (!n) return;
+#if defined(__linux__)
+        const size_t align = 2ull * 1024 * 1024;
+        void* raw = mmap(nullptr, n + align, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) return;
+        uintptr_t base = reinterpret_cast<uintptr_t>(raw);
+        uintptr_t aligned = (base + align - 1) & ~(align - 1);
+        if (aligned > base) munmap(raw, aligned - base);
+        size_t tail = (base + n + align) - (aligned + n);
+        if (tail) munmap(reinterpret_cast<void*>(aligned + n), tail);
+        (void) madvise(reinterpret_cast<void*>(aligned), n, MADV_HUGEPAGE);
+        base_ = reinterpret_cast<uintptr_t>(raw); map_len_ = n + align;
+        p_ = reinterpret_cast<uint8_t*>(aligned);
+#else
+        void* raw = std::malloc(n);
+        base_ = reinterpret_cast<uintptr_t>(raw); map_len_ = n;
+        p_ = static_cast<uint8_t*>(raw);
+#endif
+    }
+    uint8_t* p_ = nullptr;
+    uintptr_t base_ = 0;
+    size_t map_len_ = 0, cap_ = 0, size_ = 0;
+};
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.

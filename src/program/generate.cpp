@@ -177,6 +177,9 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -3192,6 +3195,16 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // The conversation cache's parked snapshots are 16 MiB segments; glibc's dynamic mmap
+    // threshold grows to 32 MiB, so they come from the BRACK heap - a fragmented VMA that
+    // TRANSPARENT huge pages cannot back (measured: the engine's heap was 0.3 % huge, so a
+    // restore paid a scattered 4 KiB page-in at 240-440 MB/s instead of the device's 1.1 GB/s).
+    // Fixing the threshold makes every segment an mmap, which THP can back with 2 MiB pages.
+    // Set before any allocation.
+#if defined(__GLIBC__)
+    mallopt(M_MMAP_THRESHOLD, 8 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
+#endif
     strata::platform::restore_normal_io_priority();   // #4733: not the low disk priority of the program that started this one
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     {   // 0.2.1.2: hipblas / libhipblaslt / rocblas are delay-loaded (CMakeLists.txt) and live in <exe folder>\rocm\bin, which only the
